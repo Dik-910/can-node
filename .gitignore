@@ -1,0 +1,30 @@
+# 编译产物
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+build/
+Debug/
+Release/
+output/
+
+# STM32CubeIDE / CubeMX（*.ioc 要入库，别忽略）
+.settings/
+.project
+.cproject
+.mxproject
+*.launch
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
