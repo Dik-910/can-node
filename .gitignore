@@ -32,3 +32,4 @@ Thumbs.db
 # 单测产物
 /test/can_matrix_test
 /test/can_driver_test
+/test/isotp_test
