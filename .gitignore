@@ -33,3 +33,4 @@ Thumbs.db
 /test/can_matrix_test
 /test/can_driver_test
 /test/isotp_test
+/test/uds_test
