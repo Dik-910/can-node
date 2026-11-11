@@ -1,0 +1,96 @@
+VERSION "can-node / bms-node matrix v0.1"
+
+NS_ :
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: Node BMS Gateway Tester
+
+
+BO_ 384 NodeStatus: 8 Node
+ SG_ NodeState : 0|8@1+ (1,0) [0|3] "" Gateway
+ SG_ ErrLevel : 8|8@1+ (1,0) [0|2] "" Gateway
+ SG_ BusOffCnt : 16|16@1+ (1,0) [0|65535] "" Gateway
+ SG_ UptimeS : 32|32@1+ (1,0) [0|4294967295] "s" Gateway
+
+BO_ 385 BusStatus: 8 Node
+ SG_ Tec : 0|8@1+ (1,0) [0|255] "" Gateway
+ SG_ Rec : 8|8@1+ (1,0) [0|255] "" Gateway
+ SG_ BusLoadPermille : 16|16@1+ (1,0) [0|1000] "permille" Gateway
+
+BO_ 512 PackData: 8 BMS
+ SG_ PackVoltage : 0|16@1+ (0.01,0) [0|655.35] "V" Gateway
+ SG_ PackCurrent : 16|16@1- (0.01,0) [-327.68|327.67] "A" Gateway
+ SG_ Soc : 32|8@1+ (1,0) [0|100] "%" Gateway
+ SG_ TempMax : 40|8@1- (1,-40) [-40|215] "degC" Gateway
+ SG_ ProtState : 48|8@1+ (1,0) [0|3] "" Gateway
+ SG_ FaultCode : 56|8@1+ (1,0) [0|255] "" Gateway
+
+BO_ 640 FaultEvent: 8 BMS
+ SG_ FaultCode : 0|16@1+ (1,0) [0|65535] "" Gateway
+ SG_ FaultLevel : 16|8@1+ (1,0) [0|3] "" Gateway
+ SG_ OccurCount : 24|8@1+ (1,0) [0|255] "" Gateway
+ SG_ EventTimeS : 32|32@1+ (1,0) [0|4294967295] "s" Gateway
+
+BO_ 768 ControlCmd: 4 Gateway
+ SG_ Cmd : 0|8@1+ (1,0) [1|3] "" Node,BMS
+ SG_ Seq : 8|8@1+ (1,0) [0|255] "" Node,BMS
+ SG_ Param : 16|16@1+ (1,0) [0|65535] "" Node,BMS
+
+
+BA_DEF_ BO_ "GenMsgCycleTime" INT 0 65535;
+BA_DEF_ BO_ "GenMsgSendType" ENUM "Cyclic","Event";
+BA_DEF_DEF_ "GenMsgCycleTime" 0;
+BA_DEF_DEF_ "GenMsgSendType" "Event";
+BA_ "GenMsgSendType" BO_ 384 0;
+BA_ "GenMsgCycleTime" BO_ 384 100;
+BA_ "GenMsgSendType" BO_ 385 0;
+BA_ "GenMsgCycleTime" BO_ 385 20;
+BA_ "GenMsgSendType" BO_ 512 0;
+BA_ "GenMsgCycleTime" BO_ 512 50;
+BA_ "GenMsgSendType" BO_ 640 1;
+BA_ "GenMsgSendType" BO_ 768 1;
+
+VAL_ 384 NodeState 0 "Init" 1 "Normal" 2 "Degraded" 3 "Fault" ;
+VAL_ 384 ErrLevel 0 "ErrorActive" 1 "ErrorPassive" 2 "BusOff" ;
+VAL_ 512 ProtState 0 "Normal" 1 "Warning" 2 "Protect" 3 "Recover" ;
+VAL_ 640 FaultLevel 0 "Info" 1 "Warning" 2 "Protect" 3 "Critical" ;
+VAL_ 768 Cmd 1 "Start" 2 "Stop" 3 "ClearFault" ;
+
+CM_ "报文定义与 can-node/docs/protocol.md 保持一致，变更需同步提升版本号";
+CM_ BO_ 384 "节点状态与心跳，周期 100ms";
+CM_ BO_ 385 "总线错误计数与负载率，周期 20ms";
+CM_ BO_ 512 "储能采样数据，周期 50ms";
+CM_ BO_ 640 "故障事件，状态迁移时触发";
+CM_ BO_ 768 "网关控制命令，带序列号防丢";
+CM_ SG_ 385 Tec "发送错误计数，饱和值 255；超限原始值请走 UDS 0x22 读取";
+CM_ SG_ 512 PackCurrent "充电为正、放电为负";
+CM_ SG_ 768 Seq "节点在 NodeStatus 中回报最近处理的序列号";

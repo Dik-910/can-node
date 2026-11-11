@@ -60,8 +60,11 @@ docs/        协议与设计文档
 
 ## 通信协议
 
-报文 ID 分配、信号布局、字节序与周期定义见 [docs/protocol.md](docs/protocol.md)。
-该文件与 bms-node、网关端共用同一版本，任一侧变更需同步更新。
+报文 ID 分配、信号布局、字节序与周期定义见 [docs/protocol.md](docs/protocol.md)，
+机器可读定义见 [docs/can_matrix.dbc](docs/can_matrix.dbc)。
+
+DBC 是唯一权威来源，已通过 `cantools` 加载与编解码往返验证。节点端与网关端
+都应从同一份 DBC 生成解析代码，不要各自手写字节偏移。任一侧变更需同步更新并提升版本号。
 
 ## 构建
 

@@ -75,6 +75,20 @@
 > 带 `seq` 是因为 CAN 无重传机制，网关需要判断命令是否被接收方处理过。
 > 节点在 `0x180` 的 `node_state` 里回报最近处理的 `seq`。
 
+### 2.5 故障事件 `0x280`
+
+发送方：bms-node。事件触发，非周期。DLC = 8。
+
+| 起始位 | 长度 | 信号 | 类型 | 说明 |
+|---|---|---|---|---|
+| 0 | 16 | `fault_code` | uint16 | 故障编号 |
+| 16 | 8 | `fault_level` | uint8 | 0 提示 / 1 告警 / 2 保护 / 3 严重 |
+| 24 | 8 | `occur_count` | uint8 | 同一故障累计出现次数，饱和 255 |
+| 32 | 32 | `event_time_s` | uint32 | 相对上电的秒数，小端 |
+
+> 故障事件只在状态迁移时发送，不做周期重复。网关丢失单帧时，
+> 靠下一次 `0x200` 里的 `fault_code` 字段恢复当前状态。
+
 ## 3. 字节序
 
 - 多字节信号统一**小端**（Intel 格式），与 Cortex-M 原生一致，避免转换开销。
@@ -98,3 +112,15 @@ ISO-TP 参数：
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v0.1 | 2026-11 | 初稿，确定 ID 分段与四类基础报文 |
+
+## 6. 机器可读定义
+
+本文件的表格与 [`can_matrix.dbc`](can_matrix.dbc) 一一对应，**以 DBC 为准**。
+DBC 已通过 `cantools` 加载与编解码往返验证，可直接用于：
+
+```bash
+pip install cantools
+python -c "import cantools; db=cantools.database.load_file('docs/can_matrix.dbc'); print(db.messages)"
+```
+
+网关端与节点端都应从同一个 DBC 生成解析代码，不要各自手写字节偏移。
