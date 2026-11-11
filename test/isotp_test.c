@@ -11,6 +11,8 @@
  *
  * 用桩驱动扮演「对端」：桩的 tx 队列是我们发出去的帧，rx 队列是对端发来的帧。
  * 因此每个场景都能逐帧断言中间状态，而不是只看最终结果。
+ *
+ * 测试输出一律英文：中文常量在不同终端 locale 与嵌入式工具链下容易编码错乱。
  */
 
 static int passed = 0;
@@ -63,19 +65,19 @@ static void test_single_frame_tx(void)
     can_frame_t out;
     const uint8_t payload[5] = {0x10, 0x03, 0x22, 0xF1, 0x90};
 
-    printf("单帧发送（5 字节）\n");
+    printf("Single frame tx (5 bytes)\n");
 
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
     isotp_init(&tp, &cfg);
 
-    check(isotp_send(&tp, &can, payload, 5) == ISOTP_OK, "小于 7 字节一次发完");
-    check(isotp_tx_busy(&tp) == 0, "不处于传输中");
+    check(isotp_send(&tp, &can, payload, 5) == ISOTP_OK, "payload <= 7 bytes sent at once");
+    check(isotp_tx_busy(&tp) == 0, "not busy");
 
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "取到发出的帧");
-    check(out.id == 0x7E0, "使用 tx_id");
-    check(out.dlc == 6, "DLC = 1 + 5");
-    check(out.data[0] == 0x05, "PCI 为单帧且长度 5");
-    check(memcmp(&out.data[1], payload, 5) == 0, "数据区一致");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "frame available");
+    check(out.id == 0x7E0, "uses tx_id");
+    check(out.dlc == 6, "dlc = 1 + 5");
+    check(out.data[0] == 0x05, "pci is single frame with length 5");
+    check(memcmp(&out.data[1], payload, 5) == 0, "payload matches");
 }
 
 /* 长报文：首帧 + 连续帧，验证切分与序号 */
@@ -89,7 +91,7 @@ static void test_multi_frame_tx(void)
     uint8_t payload[20];
     int rc;
 
-    printf("多帧发送（20 字节）\n");
+    printf("Multi frame tx (20 bytes)\n");
 
     for (int i = 0; i < 20; i++)
         payload[i] = (uint8_t)(0x40 + i);
@@ -98,33 +100,33 @@ static void test_multi_frame_tx(void)
     isotp_init(&tp, &cfg);
 
     rc = isotp_send(&tp, &can, payload, 20);
-    check(rc == ISOTP_BUSY, "发起后进入等待流控");
-    check(isotp_tx_busy(&tp) == 1, "处于传输中");
+    check(rc == ISOTP_BUSY, "enters wait-for-flow-control");
+    check(isotp_tx_busy(&tp) == 1, "busy while transferring");
 
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "发出首帧");
-    check(out.data[0] == 0x10, "PCI 为首帧，长度高 4 位为 0");
-    check(out.data[1] == 20, "长度低 8 位为 20");
-    check(out.dlc == 8, "首帧满载 8 字节");
-    check(memcmp(&out.data[2], payload, 6) == 0, "首帧带前 6 字节");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "first frame sent");
+    check(out.data[0] == 0x10, "pci is first frame, high nibble 0");
+    check(out.data[1] == 20, "length low byte is 20");
+    check(out.dlc == 8, "first frame is full 8 bytes");
+    check(memcmp(&out.data[2], payload, 6) == 0, "first frame carries 6 bytes");
 
     /* 没有流控帧之前不应发连续帧 */
     isotp_poll(&tp, &can);
-    check(can_stub_tx_count(&stub) == 0, "未收到流控前不发连续帧");
+    check(can_stub_tx_count(&stub) == 0, "no consecutive frame before flow control");
 
     inject_fc(&stub, cfg.rx_id, ISOTP_FS_CTS, 0, 0);
 
     isotp_poll(&tp, &can);
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "发出第 1 个连续帧");
-    check(out.data[0] == 0x21, "序号为 1");
-    check(memcmp(&out.data[1], payload + 6, 7) == 0, "携带第 7..13 字节");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "consecutive frame 1 sent");
+    check(out.data[0] == 0x21, "sequence number 1");
+    check(memcmp(&out.data[1], payload + 6, 7) == 0, "carries bytes 7..13");
 
     isotp_poll(&tp, &can);
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "发出第 2 个连续帧");
-    check(out.data[0] == 0x22, "序号为 2");
-    check(out.dlc == 8, "最后一帧剩余 7 字节，满载");
-    check(memcmp(&out.data[1], payload + 13, 7) == 0, "携带第 14..20 字节");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "consecutive frame 2 sent");
+    check(out.data[0] == 0x22, "sequence number 2");
+    check(out.dlc == 8, "last frame carries remaining 7 bytes");
+    check(memcmp(&out.data[1], payload + 13, 7) == 0, "carries bytes 14..20");
 
-    check(isotp_tx_busy(&tp) == 0, "20 字节发完，回到空闲");
+    check(isotp_tx_busy(&tp) == 0, "transfer finished after 20 bytes");
 }
 
 /* 对端通告块大小，发满一块必须停下等新的流控帧 */
@@ -138,7 +140,7 @@ static void test_block_size(void)
     uint8_t payload[30];
     unsigned before;
 
-    printf("流控分块（BS = 2）\n");
+    printf("Flow control block size (BS = 2)\n");
 
     for (int i = 0; i < 30; i++)
         payload[i] = (uint8_t)i;
@@ -153,15 +155,15 @@ static void test_block_size(void)
 
     isotp_poll(&tp, &can); /* 第 1 帧 */
     isotp_poll(&tp, &can); /* 第 2 帧，本块已满 */
-    check(can_stub_tx_count(&stub) == 2, "块内发满 2 帧");
+    check(can_stub_tx_count(&stub) == 2, "stops after block size reached");
 
     before = can_stub_tx_count(&stub);
     isotp_poll(&tp, &can);
-    check(can_stub_tx_count(&stub) == before, "块满后不再继续发");
+    check(can_stub_tx_count(&stub) == before, "no frame while waiting for next fc");
 
     inject_fc(&stub, cfg.rx_id, ISOTP_FS_CTS, 2, 0);
     isotp_poll(&tp, &can);
-    check(can_stub_tx_count(&stub) == before + 1, "收到新流控后继续");
+    check(can_stub_tx_count(&stub) == before + 1, "resumes after new flow control");
 }
 
 /* 对端报告溢出 */
@@ -174,7 +176,7 @@ static void test_fc_overflow(void)
     uint8_t payload[20];
     int rc;
 
-    printf("对端流控溢出\n");
+    printf("Peer flow control overflow\n");
 
     memset(payload, 0x11, sizeof(payload));
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
@@ -184,8 +186,8 @@ static void test_fc_overflow(void)
     inject_fc(&stub, cfg.rx_id, ISOTP_FS_OVFLW, 0, 0);
     rc = isotp_poll(&tp, &can);
 
-    check(rc == ISOTP_ERR_FC_OVERFLOW, "返回流控溢出");
-    check(isotp_tx_busy(&tp) == 0, "传输被中止");
+    check(rc == ISOTP_ERR_FC_OVERFLOW, "returns flow control overflow");
+    check(isotp_tx_busy(&tp) == 0, "transfer aborted");
 }
 
 /* 接收单帧 */
@@ -199,17 +201,17 @@ static void test_single_frame_rx(void)
     uint16_t len = 0;
     uint8_t d[5] = {0x03, 0x62, 0xF1, 0x90, 0xAA};
 
-    printf("单帧接收\n");
+    printf("Single frame rx\n");
 
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
     isotp_init(&tp, &cfg);
 
     inject_frame(&stub, cfg.rx_id, d, 5);
-    check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "收到完整报文");
-    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "取走报文");
-    check(len == 3, "长度为 3");
-    check(msg[0] == 0x62 && msg[2] == 0x90, "内容正确");
-    check(isotp_recv(&tp, msg, &len) == ISOTP_ERR_NOMSG, "重复取返回 NOMSG");
+    check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "complete message received");
+    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "message popped");
+    check(len == 3, "length is 3");
+    check(msg[0] == 0x62 && msg[2] == 0x90, "content matches");
+    check(isotp_recv(&tp, msg, &len) == ISOTP_ERR_NOMSG, "second pop returns NOMSG");
 }
 
 /* 接收多帧：收到首帧要自动回流量控制，再拼连续帧 */
@@ -224,7 +226,7 @@ static void test_multi_frame_rx(void)
     uint16_t len = 0;
     uint8_t expect[20];
 
-    printf("多帧接收（20 字节）\n");
+    printf("Multi frame rx (20 bytes)\n");
 
     for (int i = 0; i < 20; i++)
         expect[i] = (uint8_t)(0x80 + i);
@@ -241,12 +243,12 @@ static void test_multi_frame_rx(void)
         inject_frame(&stub, cfg.rx_id, d, 8);
     }
 
-    check(isotp_poll(&tp, &can) == ISOTP_BUSY, "首帧到达，进入接收");
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "自动发出流控帧");
-    check(out.id == cfg.tx_id, "流控帧用 tx_id");
-    check(out.data[0] == 0x30, "流控状态为 CTS");
-    check(out.data[1] == 8, "通告我方块大小");
-    check(out.data[2] == 10, "通告我方 STmin");
+    check(isotp_poll(&tp, &can) == ISOTP_BUSY, "first frame accepted, receiving");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "flow control sent automatically");
+    check(out.id == cfg.tx_id, "flow control uses tx_id");
+    check(out.data[0] == 0x30, "flow status is CTS");
+    check(out.data[1] == 8, "advertises local block size");
+    check(out.data[2] == 10, "advertises local stmin");
 
     /* 第 1 个连续帧 */
     {
@@ -255,7 +257,7 @@ static void test_multi_frame_rx(void)
         memcpy(&d[1], expect + 6, 7);
         inject_frame(&stub, cfg.rx_id, d, 8);
     }
-    check(isotp_poll(&tp, &can) == ISOTP_BUSY, "收到第 1 个连续帧");
+    check(isotp_poll(&tp, &can) == ISOTP_BUSY, "consecutive frame 1 accepted");
 
     /* 第 2 个连续帧，凑满 20 */
     {
@@ -264,11 +266,11 @@ static void test_multi_frame_rx(void)
         memcpy(&d[1], expect + 13, 7);
         inject_frame(&stub, cfg.rx_id, d, 8);
     }
-    check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "收齐 20 字节");
+    check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "20 bytes assembled");
 
-    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "取走完整报文");
-    check(len == 20, "长度为 20");
-    check(memcmp(msg, expect, 20) == 0, "内容逐字节一致");
+    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "message popped");
+    check(len == 20, "length is 20");
+    check(memcmp(msg, expect, 20) == 0, "content byte-exact");
 }
 
 /* 序号跳变必须整包废弃 */
@@ -281,7 +283,7 @@ static void test_sequence_error(void)
     uint8_t d[8];
     int rc;
 
-    printf("连续帧序号错误\n");
+    printf("Consecutive frame sequence error\n");
 
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
     isotp_init(&tp, &cfg);
@@ -298,7 +300,7 @@ static void test_sequence_error(void)
     inject_frame(&stub, cfg.rx_id, d, 8);
     rc = isotp_poll(&tp, &can);
 
-    check(rc == ISOTP_ERR_SEQ, "返回序号错误");
+    check(rc == ISOTP_ERR_SEQ, "returns sequence error");
 }
 
 /* 长度与缓冲上限 */
@@ -313,14 +315,14 @@ static void test_limits(void)
     static uint8_t huge[ISOTP_MAX_PAYLOAD + 1];
     int rc;
 
-    printf("长度与缓冲上限\n");
+    printf("Length and buffer limits\n");
 
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
     isotp_init(&tp, &cfg);
 
-    check(isotp_send(&tp, &can, huge, 0) == ISOTP_ERR_TOO_LARGE, "长度 0 被拒绝");
+    check(isotp_send(&tp, &can, huge, 0) == ISOTP_ERR_TOO_LARGE, "length 0 rejected");
     check(isotp_send(&tp, &can, huge, ISOTP_MAX_PAYLOAD + 1) == ISOTP_ERR_TOO_LARGE,
-          "超过 4095 被拒绝");
+          "length above 4095 rejected");
 
     /* 接收方向：首帧声明的长度超过缓冲，应回 OVFLW 并报错 */
     d[0] = 0x11; /* 长度高 4 位为 1 */
@@ -328,7 +330,7 @@ static void test_limits(void)
     memset(&d[2], 0, 6);
     inject_frame(&stub, cfg.rx_id, d, 8);
     rc = isotp_poll(&tp, &can);
-    check(rc == ISOTP_BUSY, "511 字节在缓冲范围内，接受");
+    check(rc == ISOTP_BUSY, "511 bytes accepted, within buffer");
 
     /*
      * 测真正的溢出（0xFFF = 4095 > 512）。
@@ -340,9 +342,9 @@ static void test_limits(void)
     d[1] = 0xFF;
     inject_frame(&stub, cfg.rx_id, d, 8);
     rc = isotp_poll(&tp, &can);
-    check(rc == ISOTP_ERR_OVERFLOW, "4095 字节超过接收缓冲，报溢出");
-    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "回了流控帧");
-    check(out.data[0] == 0x32, "流控状态为 OVFLW");
+    check(rc == ISOTP_ERR_OVERFLOW, "4095 bytes exceeds rx buffer");
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "flow control replied");
+    check(out.data[0] == 0x32, "flow status is OVFLW");
 }
 
 /* 中止 */
@@ -354,23 +356,23 @@ static void test_abort(void)
     isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
     uint8_t payload[20];
 
-    printf("主动中止\n");
+    printf("Abort\n");
 
     memset(payload, 0x22, sizeof(payload));
     can_driver_init(&can, can_stub_ops(), &stub, 500000);
     isotp_init(&tp, &cfg);
 
     isotp_send(&tp, &can, payload, 20);
-    check(isotp_tx_busy(&tp) == 1, "传输开始");
+    check(isotp_tx_busy(&tp) == 1, "transfer started");
 
     isotp_abort(&tp);
-    check(isotp_tx_busy(&tp) == 0, "中止后回到空闲");
-    check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY, "可以重新发起");
+    check(isotp_tx_busy(&tp) == 0, "idle after abort");
+    check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY, "can start again");
 }
 
 int main(void)
 {
-    printf("=== ISO-TP 测试 ===\n\n");
+    printf("=== ISO-TP test ===\n\n");
     test_single_frame_tx();
     printf("\n");
     test_multi_frame_tx();
@@ -389,6 +391,6 @@ int main(void)
     printf("\n");
     test_abort();
 
-    printf("\n结果：%d 通过，%d 失败\n", passed, failed);
+    printf("\nResult: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

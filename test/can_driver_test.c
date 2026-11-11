@@ -14,6 +14,8 @@
  *
  * 这些用例的意义在于：等 STM32 硬件到了，只要新的 ops 实现能跑通同一套用例，
  * 就说明平台适配没引入行为差异。
+ *
+ * 测试输出一律英文：中文常量在不同终端 locale 与嵌入式工具链下容易编码错乱。
  */
 
 static int passed = 0;
@@ -45,7 +47,7 @@ static void make_frame(can_frame_t *f, uint32_t id, uint8_t dlc)
 /* 抽象层：参数与状态校验 */
 static void test_layer_checks(void)
 {
-    printf("抽象层参数校验\n");
+    printf("Layer parameter checks\n");
 
     can_stub_t stub;
     can_driver_t drv;
@@ -53,37 +55,37 @@ static void test_layer_checks(void)
     make_frame(&f, 0x180, 8);
 
     check(can_driver_init(0, can_stub_ops(), &stub, 500000) == CAN_ERR_PARAM,
-          "drv 为空被拒绝");
+          "null driver rejected");
     check(can_driver_init(&drv, 0, &stub, 500000) == CAN_ERR_PARAM,
-          "ops 为空被拒绝");
+          "null ops rejected");
 
     /* 未初始化时所有操作都应返回 STATE，而不是崩溃 */
     memset(&drv, 0, sizeof(drv));
-    check(can_driver_send(&drv, &f) == CAN_ERR_STATE, "未初始化 send 返回 STATE");
-    check(can_driver_recv(&drv, &f) == CAN_ERR_STATE, "未初始化 recv 返回 STATE");
-    check(can_driver_get_status(&drv, 0) == CAN_ERR_STATE, "未初始化 get_status 返回 STATE");
+    check(can_driver_send(&drv, &f) == CAN_ERR_STATE, "send before init returns STATE");
+    check(can_driver_recv(&drv, &f) == CAN_ERR_STATE, "recv before init returns STATE");
+    check(can_driver_get_status(&drv, 0) == CAN_ERR_STATE, "get_status before init returns STATE");
 
-    check(can_driver_init(&drv, can_stub_ops(), &stub, 500000) == CAN_OK, "初始化成功");
+    check(can_driver_init(&drv, can_stub_ops(), &stub, 500000) == CAN_OK, "init succeeds");
 
     /* 帧合法性 */
     make_frame(&f, 0x800, 8);
-    check(can_driver_send(&drv, &f) == CAN_ERR_PARAM, "ID 0x800 越界被拒绝");
+    check(can_driver_send(&drv, &f) == CAN_ERR_PARAM, "id 0x800 out of range rejected");
 
     make_frame(&f, 0x180, 9);
-    check(can_driver_send(&drv, &f) == CAN_ERR_PARAM, "DLC 9 超限被拒绝");
+    check(can_driver_send(&drv, &f) == CAN_ERR_PARAM, "dlc 9 rejected");
 
-    check(can_driver_send(&drv, 0) == CAN_ERR_PARAM, "空帧指针被拒绝");
-    check(can_driver_recv(&drv, 0) == CAN_ERR_PARAM, "空接收缓冲被拒绝");
+    check(can_driver_send(&drv, 0) == CAN_ERR_PARAM, "null frame rejected");
+    check(can_driver_recv(&drv, 0) == CAN_ERR_PARAM, "null rx buffer rejected");
 
     /* 边界值应当通过 */
     make_frame(&f, 0x7FF, 8);
-    check(can_driver_send(&drv, &f) == CAN_OK, "ID 0x7FF 边界值通过");
+    check(can_driver_send(&drv, &f) == CAN_OK, "id 0x7FF boundary accepted");
 }
 
 /* 收发往返 */
 static void test_roundtrip(void)
 {
-    printf("收发往返\n");
+    printf("Send / receive roundtrip\n");
 
     can_stub_t stub;
     can_driver_t drv;
@@ -91,28 +93,28 @@ static void test_roundtrip(void)
 
     can_driver_init(&drv, can_stub_ops(), &stub, 500000);
 
-    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "空队列 recv 返回 NOMSG");
+    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "recv on empty queue returns NOMSG");
 
     make_frame(&f, 0x200, 8);
-    check(can_driver_send(&drv, &f) == CAN_OK, "发送成功");
-    check(can_stub_tx_count(&stub) == 1, "桩记录了 1 帧待发");
+    check(can_driver_send(&drv, &f) == CAN_OK, "send succeeds");
+    check(can_stub_tx_count(&stub) == 1, "stub records one pending frame");
 
-    check(can_stub_pop_tx(&stub, &got) == CAN_OK, "取出已发送帧");
-    check(got.id == 0x200 && got.dlc == 8, "ID 与 DLC 一致");
-    check(memcmp(got.data, f.data, 8) == 0, "数据场一致");
+    check(can_stub_pop_tx(&stub, &got) == CAN_OK, "pop the sent frame");
+    check(got.id == 0x200 && got.dlc == 8, "id and dlc match");
+    check(memcmp(got.data, f.data, 8) == 0, "payload matches");
 
     make_frame(&f, 0x300, 4);
-    check(can_stub_inject_rx(&stub, &f) == CAN_OK, "注入一帧到接收队列");
-    check(can_stub_rx_count(&stub) == 1, "接收队列有 1 帧");
-    check(can_driver_recv(&drv, &got) == CAN_OK, "上层收到该帧");
-    check(got.id == 0x300 && got.dlc == 4, "注入帧内容一致");
-    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "取完后队列为空");
+    check(can_stub_inject_rx(&stub, &f) == CAN_OK, "inject one rx frame");
+    check(can_stub_rx_count(&stub) == 1, "rx queue holds one frame");
+    check(can_driver_recv(&drv, &got) == CAN_OK, "caller receives it");
+    check(got.id == 0x300 && got.dlc == 4, "injected frame matches");
+    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "queue empty afterwards");
 }
 
 /* 错误状态与 TEC 行为 */
 static void test_error_state(void)
 {
-    printf("错误状态与 TEC\n");
+    printf("Error state and TEC behaviour\n");
 
     can_stub_t stub;
     can_driver_t drv;
@@ -124,38 +126,37 @@ static void test_error_state(void)
 
     /* 模拟进入错误被动 */
     can_stub_set_status(&stub, 130, 5, CAN_LEVEL_PASSIVE);
-    check(can_driver_get_status(&drv, &st) == CAN_OK, "读取状态成功");
-    check(st.tec == 130 && st.rec == 5, "TEC/REC 正确");
-    check(st.level == CAN_LEVEL_PASSIVE, "级别为被动");
+    check(can_driver_get_status(&drv, &st) == CAN_OK, "read status succeeds");
+    check(st.tec == 130 && st.rec == 5, "tec / rec match");
+    check(st.level == CAN_LEVEL_PASSIVE, "level is passive");
 
     /* 成功发送使 TEC 递减 */
     can_driver_send(&drv, &f);
     can_driver_get_status(&drv, &st);
-    check(st.tec == 129, "成功发送后 TEC 递减 1");
+    check(st.tec == 129, "successful send decrements tec");
 
     /* TEC 回落到 127 以下应恢复主动态 */
     can_stub_set_status(&stub, 128, 0, CAN_LEVEL_PASSIVE);
     can_driver_send(&drv, &f);
     can_driver_get_status(&drv, &st);
-    check(st.tec == 127, "TEC 降到 127");
-    check(st.level == CAN_LEVEL_ACTIVE, "TEC <= 127 恢复错误主动");
+    check(st.tec == 127, "tec drops to 127");
+    check(st.level == CAN_LEVEL_ACTIVE, "tec <= 127 restores error active");
 
     /* 进入 Bus Off */
     can_stub_set_status(&stub, 255, 0, CAN_LEVEL_BUSOFF);
     can_driver_get_status(&drv, &st);
-    check(st.level == CAN_LEVEL_BUSOFF, "级别为 Bus Off");
-    check(st.busoff_count == 1, "Bus Off 计数加 1");
+    check(st.level == CAN_LEVEL_BUSOFF, "level is bus off");
+    check(st.busoff_count == 1, "bus-off counter incremented");
 
-    check(can_driver_send(&drv, &f) == CAN_ERR_BUSOFF, "Bus Off 时发送被拒绝");
+    check(can_driver_send(&drv, &f) == CAN_ERR_BUSOFF, "send rejected while bus off");
 
-    /* Bus Off 下仍可收帧？真实控制器不能，桩保持一致的保守行为 */
-    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "Bus Off 下无待收帧");
+    check(can_driver_recv(&drv, &got) == CAN_ERR_NOMSG, "no pending rx while bus off");
 }
 
 /* 队列满 */
 static void test_queue_full(void)
 {
-    printf("发送队列上限\n");
+    printf("Tx queue limit\n");
 
     can_stub_t stub;
     can_driver_t drv;
@@ -173,14 +174,14 @@ static void test_queue_full(void)
             sent++;
     }
 
-    check(sent == CAN_STUB_QUEUE_LEN, "最多缓存 16 帧");
-    check(ret == CAN_ERR_FULL, "超出后返回 FULL");
+    check(sent == CAN_STUB_QUEUE_LEN, "queue holds at most 16 frames");
+    check(ret == CAN_ERR_FULL, "returns FULL when exceeded");
 }
 
 /* 反初始化 */
 static void test_deinit(void)
 {
-    printf("反初始化\n");
+    printf("Deinit\n");
 
     can_stub_t stub;
     can_driver_t drv;
@@ -190,13 +191,13 @@ static void test_deinit(void)
     make_frame(&f, 0x200, 8);
 
     can_driver_deinit(&drv);
-    check(drv.ops == 0, "反初始化后 ops 清空");
-    check(can_driver_send(&drv, &f) == CAN_ERR_STATE, "反初始化后 send 返回 STATE");
+    check(drv.ops == 0, "ops cleared after deinit");
+    check(can_driver_send(&drv, &f) == CAN_ERR_STATE, "send after deinit returns STATE");
 }
 
 int main(void)
 {
-    printf("=== CAN 抽象层测试 ===\n\n");
+    printf("=== CAN abstraction layer test ===\n\n");
     test_layer_checks();
     printf("\n");
     test_roundtrip();
@@ -207,6 +208,6 @@ int main(void)
     printf("\n");
     test_deinit();
 
-    printf("\n结果：%d 通过，%d 失败\n", passed, failed);
+    printf("\nResult: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }
