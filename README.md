@@ -45,6 +45,25 @@
 
 上层不直接访问寄存器，驱动层通过 `can_driver.h` / `flash_driver.h` 暴露接口，便于在 PC 侧用桩替换。
 
+### 平台适配
+
+CAN 驱动以操作表形式注入，上层只依赖 `src/can/can_driver.h`：
+
+```c
+const can_driver_ops_t *ops = can_stm32_ops();
+can_driver_t drv;
+can_driver_init(&drv, ops, &ctx, 500000);
+```
+
+接入新平台只需实现 `init` / `send` / `recv` / `get_status` 四个函数（`deinit` 可选）。
+参数校验（ID 越界、DLC 超限、空指针、未初始化调用）由通用层统一完成，平台实现不必重复。
+
+仓库自带 PC 侧桩驱动 `src/can/can_driver_stub.c`，用内存队列模拟收发，并刻意模拟了
+两处真实控制器行为——**Bus Off 时拒发**、**每次成功发送 TEC 递减 1**。
+因此 ISO-TP 与 UDS 在没有硬件的情况下也能用 `make test` 验证。
+
+新平台的 ops 实现只要跑通同一套用例，就说明适配没有引入行为差异。
+
 ## 目录
 
 ```
@@ -72,9 +91,16 @@ DBC 是唯一权威来源，已通过 `cantools` 加载与编解码往返验证�
 当前处于骨架阶段，已提供 PC 侧编解码测试与代码生成链路：
 
 ```bash
-make test       # 编译并运行报文编解码测试，不依赖硬件
+make test       # 编译并运行全部 PC 侧测试，不依赖硬件
 make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 ```
+
+`make test` 当前包含两套用例：
+
+| 套件 | 覆盖内容 |
+|---|---|
+| `test/can_matrix_test` | 报文编解码、字节序、带符号信号、量程拒绝 |
+| `test/can_driver_test` | 驱动抽象层校验、收发往返、TEC 递减、Bus Off 拒发、队列上限 |
 
 依赖：PC 侧测试需要 `gcc`；重新生成代码需要 `pip install cantools`。
 

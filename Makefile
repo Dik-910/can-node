@@ -2,7 +2,6 @@ CC      ?= gcc
 CFLAGS  += -std=c99 -Wall -Wextra -I.
 
 GEN      := src/can/generated
-TEST_BIN := test/can_matrix_test
 
 .PHONY: all test dbc clean
 
@@ -13,11 +12,15 @@ dbc:
 	python3 -m cantools generate_c_source docs/can_matrix.dbc -o $(GEN)
 
 # PC 侧单元测试，不依赖硬件与 CAN 环境
-test: $(TEST_BIN)
-	./$(TEST_BIN)
+test: test/can_matrix_test test/can_driver_test
+	./test/can_matrix_test
+	./test/can_driver_test
 
-$(TEST_BIN): test/can_matrix_test.c $(GEN)/can_matrix.c
+test/can_matrix_test: test/can_matrix_test.c $(GEN)/can_matrix.c
+	$(CC) $(CFLAGS) $^ -o $@
+
+test/can_driver_test: test/can_driver_test.c src/can/can_driver.c src/can/can_driver_stub.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 clean:
-	$(RM) $(TEST_BIN)
+	$(RM) test/can_matrix_test test/can_driver_test
