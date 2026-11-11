@@ -50,18 +50,28 @@
 CAN 驱动以操作表形式注入，上层只依赖 `src/can/can_driver.h`：
 
 ```c
-const can_driver_ops_t *ops = can_stm32_ops();
+can_socketcan_t sk = {0};
+strncpy(sk.ifname, "vcan0", sizeof(sk.ifname) - 1);
+
 can_driver_t drv;
-can_driver_init(&drv, ops, &ctx, 500000);
+can_driver_init(&drv, can_socketcan_ops(), &sk, 500000);
 ```
 
 接入新平台只需实现 `init` / `send` / `recv` / `get_status` 四个函数（`deinit` 可选）。
 参数校验（ID 越界、DLC 超限、空指针、未初始化调用）由通用层统一完成，平台实现不必重复。
 
-仓库自带 PC 侧桩驱动 `src/can/can_driver_stub.c`，用内存队列模拟收发，并刻意模拟了
-两处真实控制器行为——**Bus Off 时拒发**、**每次成功发送 TEC 递减 1**。
+目前有两个实现：
+
+| 实现 | 用途 |
+|---|---|
+| `src/can/can_driver_stub.c` | PC 侧桩，内存队列模拟收发，不依赖系统 |
+| `src/can/can_driver_socketcan.c` | Linux SocketCAN，真实内核 CAN 子系统 |
+
+桩驱动刻意模拟了两处真实控制器行为——**Bus Off 时拒发**、**每次成功发送 TEC 递减 1**，
 因此 ISO-TP 与 UDS 在没有硬件的情况下也能用 `make test` 验证。
 
+**上层对此完全无感**：`make vcan` 的端到端演示里，ISO-TP 和 UDS 的代码一行没改，
+只是把 `can_stub_ops()` 换成了 `can_socketcan_ops()`。这就是抽象层的全部意义——
 新平台的 ops 实现只要跑通同一套用例，就说明适配没有引入行为差异。
 
 ### 网络层
@@ -111,13 +121,13 @@ UDS 请求转成一帧完整响应，因此可以直接用纯逻辑测试。
 
 ```
 src/bsp/           板级支持
-src/can/           CAN 驱动与收发
+src/can/           CAN 驱动与收发（抽象层 + PC 桩 + SocketCAN）
 src/can/generated/ 由 DBC 生成的编解码代码，不要手改
 src/net/           ISO-TP
 src/uds/           UDS 服务与 DID 表
-src/flash/         Flash 分区与擦写
-src/boot/          Bootloader
-test/              单元测试与 PC 侧桩
+src/boot/          Bootloader（分区表、CRC、跳转检查、升级流程）
+test/              单元测试
+examples/          可运行的端到端示例
 docs/              协议与设计文档
 ```
 
@@ -136,9 +146,10 @@ DBC 是唯一权威来源，已通过 `cantools` 加载与编解码往返验证�
 ```bash
 make test       # 编译并运行全部 PC 侧测试，不依赖硬件
 make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
+make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口）
 ```
 
-`make test` 当前包含四套用例：
+`make test` 当前包含五套用例：
 
 | 套件 | 覆盖内容 |
 |---|---|
@@ -146,6 +157,27 @@ make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 | `test/can_driver_test` | 驱动抽象层校验、收发往返、TEC 递减、Bus Off 拒发、队列上限 |
 | `test/isotp_test` | 单帧/多帧收发、流控分块、序号错误、缓冲溢出 |
 | `test/uds_test` | 服务分派、会话权限、安全访问锁定、写保护、S3 超时 |
+| `test/boot_test` | CRC32、分区表序列化、跳转检查、双区升级与回滚前提 |
+
+### 端到端演示
+
+`make vcan` 在真实 CAN 接口上依次走完「进扩展会话 → 解锁 → 写阈值 → 读回 → 读多帧」，
+输出形如：
+
+```
+[tester]  10 03
+[ecu]     50 03 00 32 13 88
+[tester]  22 F1 90
+[ecu]     62 F1 90 4C 53 56 41 41 ...   (20 字节，ISO-TP 自动分包)
+```
+
+需要先建好接口：
+
+```bash
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+```
 
 依赖：PC 侧测试需要 `gcc`；重新生成代码需要 `pip install cantools`。
 

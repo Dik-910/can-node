@@ -34,3 +34,5 @@ Thumbs.db
 /test/can_driver_test
 /test/isotp_test
 /test/uds_test
+/test/boot_test
+/vcan-demo
