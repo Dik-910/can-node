@@ -43,7 +43,9 @@
 板级层      bsp/      时钟、GPIO、引脚复用、中断向量
 ```
 
-上层不直接访问寄存器，驱动层通过 `can_driver.h` / `flash_driver.h` 暴露接口，便于在 PC 侧用桩替换。
+上层不直接访问寄存器，驱动层通过 `can_driver.h` / `boot_flash.h` 暴露接口，便于在 PC 侧用桩替换。
+
+各层的问题、设计决策与代码位置的完整说明见 [docs/architecture.md](docs/architecture.md)。
 
 ### 平台适配
 
