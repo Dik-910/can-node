@@ -48,14 +48,15 @@
 ## 目录
 
 ```
-src/bsp/     板级支持
-src/can/     CAN 驱动与收发
-src/net/     ISO-TP
-src/uds/     UDS 服务与 DID 表
-src/flash/   Flash 分区与擦写
-src/boot/    Bootloader
-test/        单元测试与 PC 侧桩
-docs/        协议与设计文档
+src/bsp/           板级支持
+src/can/           CAN 驱动与收发
+src/can/generated/ 由 DBC 生成的编解码代码，不要手改
+src/net/           ISO-TP
+src/uds/           UDS 服务与 DID 表
+src/flash/         Flash 分区与擦写
+src/boot/          Bootloader
+test/              单元测试与 PC 侧桩
+docs/              协议与设计文档
 ```
 
 ## 通信协议
@@ -68,13 +69,17 @@ DBC 是唯一权威来源，已通过 `cantools` 加载与编解码往返验证�
 
 ## 构建
 
+当前处于骨架阶段，已提供 PC 侧编解码测试与代码生成链路：
+
 ```bash
-make            # 生成 build/can-node.elf 与 .bin
-make test       # PC 侧单元测试，不依赖硬件
-make flash      # 通过 st-link 烧写
+make test       # 编译并运行报文编解码测试，不依赖硬件
+make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 ```
 
-依赖 `arm-none-eabi-gcc`。PC 侧测试使用本机 `gcc`。
+依赖：PC 侧测试需要 `gcc`；重新生成代码需要 `pip install cantools`。
+
+STM32 目标工程（`make` / `make flash`）在硬件平台确定后补齐。
+生成的编解码代码随仓库提交，使用者无需安装 Python 环境即可编译。
 
 ## 版本计划
 

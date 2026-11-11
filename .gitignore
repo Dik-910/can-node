@@ -28,3 +28,6 @@ output/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 单测产物
+/test/can_matrix_test
