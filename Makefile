@@ -44,3 +44,12 @@ vcan-demo: examples/vcan_demo.c src/can/can_driver.c src/can/can_driver_socketca
 .PHONY: vcan
 vcan: vcan-demo
 	./vcan-demo
+
+# 常驻 ECU：供第三方 tester（udsoncan / can-utils）联调
+ecu-server: examples/ecu_server.c src/can/can_driver.c src/can/can_driver_socketcan.c src/net/isotp.c src/uds/uds.c
+	$(CC) $(CFLAGS) $^ -o $@
+
+# 总线时序分析（纯计算，不依赖 CAN 接口）
+bus-load: examples/bus_load_test.c
+	$(CC) $(CFLAGS) $^ -o $@
+	./$@

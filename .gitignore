@@ -36,3 +36,5 @@ Thumbs.db
 /test/uds_test
 /test/boot_test
 /vcan-demo
+/ecu-server
+/bus-load
