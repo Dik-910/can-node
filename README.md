@@ -181,6 +181,32 @@ sudo ip link add dev vcan0 type vcan
 sudo ip link set up vcan0
 ```
 
+### 协议符合性验证
+
+单元测试只能证明「逻辑符合自己的理解」——自己发的自己收，格式错了两边一起错也能通过。
+协议符合性要用**独立实现**来验证，所以额外做了互操作测试：
+
+| 组件 | 版本 | 角色 |
+|---|---|---|
+| [udsoncan](https://github.com/pylessard/python-udsoncan) | 1.26.1 | UDS 客户端（业界主流实现） |
+| can-isotp | 2.0.7 | 独立的 ISO 15765-2 实现 |
+| python-can | 4.6.1 | SocketCAN 访问 |
+
+它们不理解本项目的代码，只按 ISO 14229 / ISO 15765-2 说话。
+
+```bash
+./ecu-server --seconds 60 &
+python3 tools/udsoncan_interop.py
+```
+
+覆盖项（14 项断言全部通过）：
+
+- 会话切换，子功能回显正确
+- **17 字节 VIN 的多帧响应被第三方完整重组，内容逐字节一致**
+- 未知 DID 返回 `NRC 0x31`，未解锁写入返回 `NRC 0x33`
+- 种子-密钥流程：客户端侧由第三方库独立实现，密钥被本实现接受
+- 解锁后写入成功，回读值一致
+
 依赖：PC 侧测试需要 `gcc`；重新生成代码需要 `pip install cantools`。
 
 STM32 目标工程（`make` / `make flash`）在硬件平台确定后补齐。

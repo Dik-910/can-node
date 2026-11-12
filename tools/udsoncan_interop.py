@@ -38,6 +38,12 @@ def check(cond, what):
         failed += 1
 
 
+def did_value(resp, did):
+    """udsoncan 对 '17s' 这类格式返回 (bytes,)，统一取出来"""
+    v = resp.service_data.values[did]
+    return v[0] if isinstance(v, tuple) else v
+
+
 def our_key_algo(level, seed, params):
     """与 can-node/src/uds/uds.c 里的 default_key 保持一致"""
     seed_int = int.from_bytes(seed, "big")
@@ -51,12 +57,21 @@ def main():
     addr = isotp.Address(isotp.AddressingMode.Normal_11bits,
                          txid=ID_REQUEST, rxid=ID_RESPONSE)
     stack = isotp.CanStack(bus=bus, address=addr,
-                           params={"blocksize": 8, "stmin": 0.005})
+                           params={"blocksize": 8, "stmin": 5})
     conn = PythonIsoTpConnection(stack)
 
     config = dict(udsoncan.configs.default_client_config)
     config["security_algo"] = our_key_algo
     config["security_algo_params"] = None
+
+    # udsoncan 要求显式声明每个 DID 的编码格式，否则拒绝发送读取请求。
+    # 这里的长度必须和 ECU 侧 DID 表一致，不一致会解析失败——正好也验证了两边定义是否同步。
+    config["data_identifiers"] = {
+        0xF190: "17s",  # VIN
+        0x0101: "2s",   # 电压，原始 2 字节
+        0x0201: "1s",   # 阈值
+        0x0999: "1s",   # 故意不存在，用来测负响应
+    }
 
     with Client(conn, request_timeout=3, config=config) as client:
         print("=== udsoncan -> can-node ECU interop test ===")
@@ -71,14 +86,14 @@ def main():
 
         r = client.change_session(uds.DiagnosticSessionControl.Session.extendedDiagnosticSession)
         check(r.positive, "change to extended session")
-        check(r.service_data.session_param == 0x03, "session echoed as 0x03")
+        check(r.service_data.session_echo == 0x03, "session echoed as 0x03")
 
         # 2. 读多帧 DID（17 字节 VIN，必须走 ISO-TP 多帧）
         print("\nReadDataByIdentifier (multi-frame)")
         r = client.read_data_by_identifier([0xF190])
         check(r.positive, "read 0xF190 accepted")
         if r.positive:
-            vin = r.service_data.values[0xF190]
+            vin = did_value(r, 0xF190)
             check(len(vin) == 17, f"VIN length is 17 (got {len(vin)})")
             check(vin == b"LSVAA1234567890AB", f"VIN content matches: {vin!r}")
 
@@ -87,7 +102,7 @@ def main():
         r = client.read_data_by_identifier([0x0101])
         check(r.positive, "read 0x0101 accepted")
         if r.positive:
-            v = r.service_data.values[0x0101]
+            v = did_value(r, 0x0101)
             check(int.from_bytes(v, "big") == 3660, f"voltage = 3660 (got {int.from_bytes(v,'big')})")
 
         # 4. 负响应：不存在的 DID
@@ -120,8 +135,8 @@ def main():
         r = client.read_data_by_identifier([0x0201])
         check(r.positive, "read back accepted")
         if r.positive:
-            check(r.service_data.values[0x0201] == bytes([0x3C]),
-                  f"read back is 0x3C (got {r.service_data.values[0x0201].hex()})")
+            back = did_value(r, 0x0201)
+            check(back == bytes([0x3C]), f"read back is 0x3C (got {back.hex()})")
 
     bus.shutdown()
 
