@@ -39,3 +39,4 @@ Thumbs.db
 /ecu-server
 /bus-load
 /node
+/test/node_health_test

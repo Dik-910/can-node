@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  += -std=c99 -Wall -Wextra -I. -Isrc/can -Isrc/net -Isrc/uds -Isrc/boot
+CFLAGS  += -std=c99 -Wall -Wextra -I. -Isrc/can -Isrc/net -Isrc/uds -Isrc/boot -Isrc/app
 
 GEN      := src/can/generated
 
@@ -12,12 +12,13 @@ dbc:
 	python3 -m cantools generate_c_source docs/can_matrix.dbc -o $(GEN)
 
 # PC 侧单元测试，不依赖硬件与 CAN 环境
-test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/boot_test
+test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/boot_test test/node_health_test
 	./test/can_matrix_test
 	./test/can_driver_test
 	./test/isotp_test
 	./test/uds_test
 	./test/boot_test
+	./test/node_health_test
 
 test/can_matrix_test: test/can_matrix_test.c $(GEN)/can_matrix.c
 	$(CC) $(CFLAGS) $^ -o $@
@@ -55,6 +56,9 @@ bus-load: examples/bus_load_test.c
 	./$@
 
 # 完整节点：周期报文 + 诊断响应，用 DBC 生成的打包函数
-node: examples/node_main.c src/can/can_driver.c src/can/can_driver_socketcan.c \
+node: examples/node_main.c src/can/can_driver.c src/can/can_driver_socketcan.c src/app/node_health.c \
       src/can/generated/can_matrix.c src/net/isotp.c src/uds/uds.c
+	$(CC) $(CFLAGS) $^ -o $@
+
+test/node_health_test: test/node_health_test.c src/app/node_health.c
 	$(CC) $(CFLAGS) $^ -o $@

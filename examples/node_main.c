@@ -13,6 +13,7 @@
 #include "src/can/generated/can_matrix.h"
 #include "src/net/isotp.h"
 #include "src/uds/uds.h"
+#include "src/app/node_health.h"
 
 /*
  * 完整节点主循环。
@@ -170,6 +171,8 @@ int main(int argc, char **argv)
     uds_server_t srv;
     uds_config_t ucfg;
     node_t node;
+    node_health_t health;
+    uint32_t last_scale = 1;
     uint8_t req[64], resp[64];
     uint16_t len = 0;
     uint64_t last_tick;
@@ -209,6 +212,8 @@ int main(int argc, char **argv)
     node.last_bus_ms = node.start_ms;
     last_tick = node.start_ms;
 
+    node_health_init(&health);
+
     printf("[node] running %d s: 0x%03X/%dms, 0x%03X/%dms, diag 0x%03X<->0x%03X\n",
            seconds, ID_NODE_STATUS, PERIOD_STATUS_MS, ID_BUS_STATUS, PERIOD_BUS_MS,
            ID_REQUEST, ID_RESPONSE);
@@ -226,20 +231,49 @@ int main(int argc, char **argv)
         last_tick = now;
         node.uptime_s = (uint32_t)((now - node.start_ms) / 1000u);
 
-        /*
-         * ---- 2. 周期任务 ----
-         * 用 last_xxx += period 而不是 last_xxx = now：
-         * 后者会把每次的调度延迟永久累积进去，周期越跑越偏。
-         */
-        while (now - node.last_status_ms >= PERIOD_STATUS_MS)
+        /* ---- 2. 总线健康与周期任务 ---- */
         {
-            send_node_status(&node, &can);
-            node.last_status_ms += PERIOD_STATUS_MS;
-        }
-        while (now - node.last_bus_ms >= PERIOD_BUS_MS)
-        {
-            send_bus_status(&node, &can);
-            node.last_bus_ms += PERIOD_BUS_MS;
+            can_bus_status_t st;
+            uint32_t scale;
+
+            if (can_driver_get_status(&can, &st) == CAN_OK)
+            {
+                node_health_update(&health, &st, (uint32_t)(now - last_tick));
+                node.err_level = (uint8_t)st.level;
+                node.busoff_cnt = (uint16_t)st.busoff_count;
+            }
+
+            scale = node_health_period_scale(&health);
+
+            /*
+             * 缩放系数变化时重置基准，否则 last += 旧周期 会让基准偏移，
+             * 恢复满速后会连着补发一批报文。
+             */
+            if (scale != last_scale)
+            {
+                node.last_status_ms = now;
+                node.last_bus_ms = now;
+                last_scale = scale;
+            }
+
+            /*
+             * 用 last_xxx += period 而不是 last_xxx = now：
+             * 后者会把每次的调度延迟永久累积进去，周期越跑越偏。
+             * 降级时周期翻倍，减少总线竞争。
+             */
+            if (node_health_can_send(&health) && scale > 0)
+            {
+                while (now - node.last_status_ms >= (uint64_t)PERIOD_STATUS_MS * scale)
+                {
+                    send_node_status(&node, &can);
+                    node.last_status_ms += (uint64_t)PERIOD_STATUS_MS * scale;
+                }
+                while (now - node.last_bus_ms >= (uint64_t)PERIOD_BUS_MS * scale)
+                {
+                    send_bus_status(&node, &can);
+                    node.last_bus_ms += (uint64_t)PERIOD_BUS_MS * scale;
+                }
+            }
         }
 
         /* ---- 3. 诊断任务 ---- */
