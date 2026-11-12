@@ -53,3 +53,8 @@ ecu-server: examples/ecu_server.c src/can/can_driver.c src/can/can_driver_socket
 bus-load: examples/bus_load_test.c
 	$(CC) $(CFLAGS) $^ -o $@
 	./$@
+
+# 完整节点：周期报文 + 诊断响应，用 DBC 生成的打包函数
+node: examples/node_main.c src/can/can_driver.c src/can/can_driver_socketcan.c \
+      src/can/generated/can_matrix.c src/net/isotp.c src/uds/uds.c
+	$(CC) $(CFLAGS) $^ -o $@
