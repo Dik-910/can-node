@@ -1,5 +1,7 @@
 # can-node
 
+[![ci](https://github.com/Dik-910/can-node/actions/workflows/ci.yml/badge.svg)](https://github.com/Dik-910/can-node/actions/workflows/ci.yml)
+
 车载 CAN 节点固件，基于 STM32 实现 CAN 通信、UDS 诊断与双区 Bootloader 在线升级。
 
 ## 功能
