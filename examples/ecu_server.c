@@ -94,24 +94,27 @@ int main(int argc, char **argv)
     uint8_t req[64], resp[64];
     uint16_t len = 0;
     int seconds = 30;
+    const char *ifname = "vcan0";
 
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             seconds = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--if") == 0 && i + 1 < argc)
+            ifname = argv[++i];
     }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
     memset(&sk, 0, sizeof(sk));
-    strncpy(sk.ifname, "vcan0", sizeof(sk.ifname) - 1);
+    strncpy(sk.ifname, ifname, sizeof(sk.ifname) - 1);
     sk.rx_filter_id = ID_REQUEST;
     sk.fd = -1;
 
     if (can_driver_init(&can, can_socketcan_ops(), &sk, 500000) != CAN_OK)
     {
-        printf("cannot open vcan0\n");
+        printf("cannot open %s\n", ifname);
         return 1;
     }
 
@@ -122,8 +125,8 @@ int main(int argc, char **argv)
     ucfg.did_count = (uint16_t)(sizeof(g_dids) / sizeof(g_dids[0]));
     uds_init(&srv, &ucfg);
 
-    printf("[ecu] listening on vcan0, req=0x%03X rsp=0x%03X, %d s\n",
-           ID_REQUEST, ID_RESPONSE, seconds);
+    printf("[ecu] listening on %s, req=0x%03X rsp=0x%03X, %d s\n",
+           ifname, ID_REQUEST, ID_RESPONSE, seconds);
     fflush(stdout);
 
     for (int tick = 0; tick < seconds * 1000 && !g_stop; tick++)
