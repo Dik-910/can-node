@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "src/can/can_driver.h"
 #include "src/can/can_driver_socketcan.h"
@@ -83,12 +84,20 @@ static void print_bytes(const char *tag, const uint8_t *d, int n)
     fflush(stdout);
 }
 
+static uint32_t now_ms32(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000));
+}
+
 int main(int argc, char **argv)
 {
     can_socketcan_t sk;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0};
+    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
     uint8_t req[64], resp[64];
@@ -145,10 +154,15 @@ int main(int argc, char **argv)
                 print_bytes("[ecu] ->", resp, rlen);
                 isotp_send(&tp, &can, resp, (uint16_t)rlen);
 
-                /* 把响应推完再继续，否则下一次请求可能打断传输 */
-                for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++)
+                /* 把响应推完再继续，否则下一次请求可能打断传输。
+                 * 超时由 ISO-TP 自己判断，见 isotp.h 里关于 N_Bs 的说明。 */
+                while (isotp_tx_busy(&tp))
                 {
-                    isotp_poll(&tp, &can);
+                    if (isotp_poll_at(&tp, &can, now_ms32()) == ISOTP_ERR_TIMEOUT)
+                    {
+                        printf("[ecu] tx timeout, transfer aborted\n");
+                        break;
+                    }
                     usleep(500);
                 }
             }

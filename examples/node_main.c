@@ -65,6 +65,7 @@ typedef struct
     uint32_t tx_frames;
     uint32_t rx_frames;
     uint32_t diag_requests;
+    uint32_t tx_timeouts;   /* 诊断响应因对端无流控而超时的次数 */
     uint32_t status_sent;
     uint32_t bus_sent;
 
@@ -167,7 +168,7 @@ int main(int argc, char **argv)
     can_socketcan_t sk;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0};
+    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
     node_t node;
@@ -290,9 +291,21 @@ int main(int argc, char **argv)
             {
                 isotp_send(&tp, &can, resp, (uint16_t)rlen);
 
-                for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++)
+                /*
+                 * 把响应推完再继续，否则下一次请求会打断传输。
+                 *
+                 * 超时交给 ISO-TP 自己判断（N_Bs），这里只负责给节拍。
+                 * 原来的写法是 for (i < 50) 写死次数：循环退出后状态仍停在
+                 * WAIT_FC，下一次 isotp_send 因 state != IDLE 而永久失败 ——
+                 * 一次对端掉线就能让这个节点再也发不出响应。
+                 */
+                while (isotp_tx_busy(&tp))
                 {
-                    isotp_poll(&tp, &can);
+                    if (isotp_poll_at(&tp, &can, (uint32_t)now_ms()) == ISOTP_ERR_TIMEOUT)
+                    {
+                        node.tx_timeouts++;
+                        break;
+                    }
                     usleep(500);
                 }
             }
@@ -308,6 +321,7 @@ int main(int argc, char **argv)
     printf("  tx frames         : %u (status %u, bus %u)\n",
            node.tx_frames, node.status_sent, node.bus_sent);
     printf("  diag requests     : %u\n", node.diag_requests);
+    printf("  isotp tx timeouts : %u\n", node.tx_timeouts);
     printf("  expected status   : %d\n", seconds * 1000 / PERIOD_STATUS_MS);
     printf("  expected bus      : %d\n", seconds * 1000 / PERIOD_BUS_MS);
     return 0;

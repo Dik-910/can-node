@@ -233,6 +233,11 @@ int isotp_init(isotp_t *tp, const isotp_config_t *cfg)
     memset(tp, 0, sizeof(*tp));
     tp->cfg = *cfg;
     tp->initialized = 1;
+
+    /* 0 表示用默认值；显式给值则尊重调用方 */
+    tp->n_bs_ms = (cfg->n_bs_ms != 0) ? cfg->n_bs_ms : ISOTP_DEFAULT_N_BS_MS;
+    tp->n_cr_ms = (cfg->n_cr_ms != 0) ? cfg->n_cr_ms : ISOTP_DEFAULT_N_CR_MS;
+
     return ISOTP_OK;
 }
 
@@ -266,13 +271,14 @@ int isotp_send(isotp_t *tp, can_driver_t *can, const uint8_t *data, uint16_t len
     return ISOTP_BUSY;
 }
 
-int isotp_poll(isotp_t *tp, can_driver_t *can)
+/*
+ * 状态机本体：收一帧、发一帧。不含超时判断。
+ * 拆出来是因为它有多处 return，超时和计时器刷新需要在外层统一处理。
+ */
+static int poll_step(isotp_t *tp, can_driver_t *can)
 {
     can_frame_t f;
     int rc;
-
-    if (tp == 0 || can == 0 || tp->initialized == 0)
-        return ISOTP_ERR_STATE;
 
     /* 先收：一张网卡上收发都走这里，不区分方向 */
     if (can_driver_recv(can, &f) == CAN_OK)
@@ -327,6 +333,120 @@ int isotp_poll(isotp_t *tp, can_driver_t *can)
     return ISOTP_OK;
 }
 
+int isotp_poll_at(isotp_t *tp, can_driver_t *can, uint32_t now_ms)
+{
+    isotp_tx_state_t prev_state;
+    uint16_t prev_sent, prev_recvd;
+    uint8_t prev_active;
+    int rc;
+
+    if (tp == 0 || can == 0 || tp->initialized == 0)
+        return ISOTP_ERR_STATE;
+
+    /*
+     * 超时检查必须放在状态机之前。
+     *
+     * 如果放在「收到帧之后」，对端掉线时永远没有帧进来，
+     * 超时判断就永远执行不到 —— 这正是原来那个 bug 的形态：
+     * 状态卡在 WAIT_FC 却没有任何路径能让它退出。
+     */
+    if (tp->tx.state != ISOTP_TX_IDLE || tp->rx.active)
+    {
+        if (!tp->timer_armed)
+        {
+            /* 本轮传输刚开始，现在起算 */
+            tp->last_activity_ms = now_ms;
+            tp->timer_armed = 1;
+        }
+        else
+        {
+            uint32_t elapsed = now_ms - tp->last_activity_ms;
+
+            /*
+             * N_Bs：发出 FF 或一块 CF 之后，等对端流控帧。
+             * 只有 WAIT_FC 受它约束；SENDING 状态每 poll 都会发一帧，
+             * 卡不住（发送失败会直接回 IDLE）。
+             */
+            if (tp->tx.state == ISOTP_TX_WAIT_FC &&
+                elapsed >= (uint32_t)tp->n_bs_ms)
+            {
+                isotp_abort(tp);
+                return ISOTP_ERR_TIMEOUT;
+            }
+
+            /*
+             * N_Cr：收到 FF/CF 之后，等对端下一个连续帧。
+             * 超时要把接收状态一起清掉，否则半个报文会一直占着
+             * rx.active，下一条新报文的首帧会被当成序号错乱而丢掉。
+             */
+            if (tp->rx.active && elapsed >= (uint32_t)tp->n_cr_ms)
+            {
+                tp->rx.active = 0;
+                tp->rx.total = 0;
+                tp->rx.received = 0;
+                tp->rx.complete = 0;
+                tp->rx.complete_len = 0;
+                tp->last_activity_ms = 0;
+                tp->timer_armed = 0;
+                return ISOTP_ERR_TIMEOUT;
+            }
+        }
+    }
+    else
+    {
+        tp->last_activity_ms = 0;
+        tp->timer_armed = 0;
+    }
+
+    /* 记基线，用于判断这一轮有没有实际推进 */
+    prev_state = tp->tx.state;
+    prev_sent = tp->tx.sent;
+    prev_recvd = tp->rx.received;
+    prev_active = tp->rx.active;
+
+    rc = poll_step(tp, can);
+
+    /*
+     * 有进度就重置计时器。
+     *
+     * 判据是「有进度」而不是「收到帧」：总线上可能有本模块不关心的帧，
+     * 按收帧刷新会让一个无关 ID 的持续流量把超时无限推迟。
+     * 只有状态迁移或字节数增加才算真推进。
+     */
+    if (tp->tx.state != prev_state || tp->tx.sent != prev_sent ||
+        tp->rx.received != prev_recvd || tp->rx.active != prev_active)
+    {
+        if (tp->tx.state != ISOTP_TX_IDLE || tp->rx.active)
+        {
+            tp->last_activity_ms = now_ms;
+            tp->timer_armed = 1;
+        }
+        else
+        {
+            tp->last_activity_ms = 0;
+            tp->timer_armed = 0;
+        }
+    }
+
+    return rc;
+}
+
+int isotp_poll(isotp_t *tp, can_driver_t *can)
+{
+    /*
+     * 不推进时间 = 不做超时检查。
+     *
+     * 传 tp->last_activity_ms 而不是 0：若正在等待，now 就是基线本身，
+     * 算出的 elapsed 恒为 0，永远不会触发超时。
+     * 生产代码请用 isotp_poll_at —— 用这个版本意味着对端掉线后会卡死。
+     */
+    if (tp == 0 || can == 0)
+        return ISOTP_ERR_STATE;
+
+    return isotp_poll_at(tp, can, tp->last_activity_ms);
+}
+
+
 int isotp_recv(isotp_t *tp, uint8_t *out, uint16_t *out_len)
 {
     if (tp == 0 || out == 0 || out_len == 0)
@@ -355,4 +475,6 @@ void isotp_abort(isotp_t *tp)
     tp->tx.len = 0;
     tp->tx.sent = 0;
     tp->tx.bs_count = 0;
+    tp->last_activity_ms = 0;
+    tp->timer_armed = 0; /* 中止后计时器失效，下次传输重新起算 */
 }

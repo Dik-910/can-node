@@ -159,7 +159,7 @@ make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口�
 |---|---|
 | `test/can_matrix_test` | 报文编解码、字节序、带符号信号、量程拒绝 |
 | `test/can_driver_test` | 驱动抽象层校验、收发往返、TEC 递减、Bus Off 拒发、队列上限 |
-| `test/isotp_test` | 单帧/多帧收发、流控分块、序号错误、缓冲溢出 |
+| `test/isotp_test` | 单帧/多帧收发、流控分块、序号错误、缓冲溢出、N_Bs/N_Cr 超时与超时后恢复、时间回绕 |
 | `test/uds_test` | 服务分派、会话权限、安全访问锁定、写保护、S3 超时 |
 | `test/boot_test` | CRC32、分区表序列化、跳转检查、双区升级与回滚前提 |
 

@@ -18,8 +18,16 @@
  *   本节点发请求用 tx_id，对端响应用 rx_id；作为服务端时反过来。
  *   本实现不区分主从，角色由配置的两个 ID 决定。
  *
- * 关于时序：本模块**不阻塞、不内置定时器**。STmin 与超时由调用方在自己的主循环里控制，
- * 这样同一份代码可以跑在裸机、RTOS 和 PC 测试环境里。
+ * 关于时序：本模块**不阻塞、不内置定时器**，但需要调用方在每次 poll 时喂当前时间。
+ * STmin 的节拍仍由调用方控制（本模块只记录时间，不 sleep），
+ * 而超时必须由本模块自己判断 —— 因为它掌握状态机，只有它知道「等了多久还没等到」。
+ *
+ * 为什么超时不能放在调用方：
+ *   早期版本让调用方写 for (i<50 && busy) { poll; usleep(500); }，
+ *   超时后循环退出了，但 tx.state 仍停在 WAIT_FC。
+ *   下一次 isotp_send 因为 state != IDLE 直接返回 ERR_STATE，
+ *   于是**对端掉线一次，本节点就永久发不出响应**。
+ *   状态机的退出必须由状态机的拥有者负责，调用方无从下手。
  */
 
 #define ISOTP_MAX_PAYLOAD 4095 /* FF 的 12 位长度字段上限 */
@@ -37,6 +45,12 @@
 #define ISOTP_ERR_OVERFLOW    (-5) /* 报文长度超过接收缓冲 */
 #define ISOTP_ERR_FC_OVERFLOW (-6) /* 对端流控帧报告溢出 */
 #define ISOTP_ERR_NOMSG       (-7) /* 没有完整报文可取 */
+#define ISOTP_ERR_TIMEOUT     (-8) /* 等流控或等连续帧超时，状态已自动复位 */
+
+/* 超时默认值，取自 ISO 15765-2 的推荐量级。
+ * 真实项目里 N_Bs 要按对端的最坏响应时间调，这里给的是通用值。 */
+#define ISOTP_DEFAULT_N_BS_MS 1000 /* 发完 FF/CF 后等对端流控帧 */
+#define ISOTP_DEFAULT_N_CR_MS 1000 /* 收到 FF/CF 后等对端下一个连续帧 */
 
 /* 流控状态 FS */
 #define ISOTP_FS_CTS    0 /* Continue To Send */
@@ -50,6 +64,14 @@ typedef struct
     uint8_t block_size;/* 我方作为接收方时通告的 BS，0 表示不分块 */
     uint8_t stmin;     /* 我方作为接收方时通告的 STmin（毫秒） */
     uint8_t padding;   /* 帧尾填充字节，0 表示不填充（用最小 DLC） */
+
+    /*
+     * 超时（毫秒），0 表示用默认值 ISOTP_DEFAULT_N_*_MS。
+     * 设为 0xFFFF 可以近似关掉检查 —— 但真要关掉，
+     * 意味着对端掉线后本节点会永久卡死，只在台架调试时考虑。
+     */
+    uint16_t n_bs_ms;
+    uint16_t n_cr_ms;
 } isotp_config_t;
 
 typedef enum
@@ -88,6 +110,23 @@ typedef struct
     isotp_tx_t tx;
     isotp_rx_t rx;
     int initialized;
+
+    /*
+     * 超时状态。last_activity_ms 在「发出 FF/CF」和「收到任意帧」时刷新，
+     * 于是两种等待自然共用同一个计时器：
+     *   tx 在 WAIT_FC/SENDING 且长时间没动静 → N_Bs 超时
+     *   rx.active 且长时间没动静            → N_Cr 超时
+     *
+     * 时间用 uint32_t 毫秒、靠无符号减法判断间隔，49.7 天回绕一次也不会错。
+     * 前提是调用方喂的是单调递增时间（裸机用 SysTick，PC 用 CLOCK_MONOTONIC）；
+     * 喂墙钟时间会在系统对时后出现负间隔，被当成巨大正数而误判超时。
+     */
+    uint32_t last_activity_ms;
+    uint8_t timer_armed; /* 计时器是否已起算。不能拿 last_activity_ms==0 判断：
+                          * 调用方的时间可能就从 0 开始（PC 测试、刚上电的 SysTick），
+                          * 那样 0 是合法时间戳，计时器永远起不来，超时也就永远不触发。 */
+    uint16_t n_bs_ms;
+    uint16_t n_cr_ms;
 } isotp_t;
 
 int isotp_init(isotp_t *tp, const isotp_config_t *cfg);
@@ -97,12 +136,27 @@ int isotp_init(isotp_t *tp, const isotp_config_t *cfg);
  *   len <= 7   走单帧，一次发完，返回 ISOTP_OK
  *   len <= 4095 走首帧 + 连续帧，返回 ISOTP_BUSY，需继续 isotp_poll
  * 返回后调用方必须保证 data 缓冲区存活到传输结束。
+ *
+ * 若上一次传输因超时被中止，状态已自动复位，这里可以正常发起新的发送。
  */
 int isotp_send(isotp_t *tp, can_driver_t *can, const uint8_t *data, uint16_t len);
 
 /*
  * 推进状态机，每次调用最多收一帧、发一帧。
- * 主循环里反复调用即可；返回值见上方 ISOTP_* 定义。
+ * now_ms 必须是单调递增的毫秒计数，用于判断 N_Bs / N_Cr 超时。
+ *
+ * 返回值：
+ *   ISOTP_OK / ISOTP_BUSY / ISOTP_RX_COMPLETE  正常推进
+ *   ISOTP_ERR_TIMEOUT                          超时，状态已复位，可重新 send
+ *   其他负数                                    协议错误
+ */
+int isotp_poll_at(isotp_t *tp, can_driver_t *can, uint32_t now_ms);
+
+/*
+ * 不喂时间的版本，等价于「本次调用不做超时检查」。
+ *
+ * 只建议在单元测试里用（测试自己控制时序、要精确断言中间状态）。
+ * 生产代码请用 isotp_poll_at —— 用这个版本意味着对端掉线后本节点会卡死。
  */
 int isotp_poll(isotp_t *tp, can_driver_t *can);
 

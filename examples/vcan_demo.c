@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "src/can/can_driver.h"
 #include "src/can/can_driver_socketcan.h"
@@ -82,6 +83,14 @@ static const uds_did_entry_t g_dids[] = {
  * 两个 isotp 实例交替推进：tester 发一帧、ecu 收一帧、ecu 回一帧、tester 收一帧。
  * 真实的两个进程不需要这样同步，这里是为了在同一进程里把时序摆清楚。
  */
+static uint32_t now_ms32(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000));
+}
+
 static int transact(can_driver_t *can_t, isotp_t *tp_t,
                     can_driver_t *can_e, isotp_t *tp_e, uds_server_t *srv,
                     const uint8_t *req, uint16_t req_len,
@@ -96,10 +105,25 @@ static int transact(can_driver_t *can_t, isotp_t *tp_t,
     if (ret < 0)
         return -1;
 
-    for (int i = 0; i < 500; i++)
+    /*
+     * 时间驱动而不是次数驱动。
+     * 原来写 for (i < 500)，卡住时会白转 500 圈才放弃，
+     * 而且看不出是「慢」还是「协议状态卡死」。
+     * 现在超时由 ISO-TP 报出来，演示能直接暴露问题。
+     */
     {
-        isotp_poll(tp_t, can_t);
-        isotp_poll(tp_e, can_e);
+        uint32_t start = now_ms32();
+
+        while ((uint32_t)(now_ms32() - start) < 1000)
+    {
+        int rc_t = isotp_poll_at(tp_t, can_t, now_ms32());
+        int rc_e = isotp_poll_at(tp_e, can_e, now_ms32());
+
+        if (rc_t == ISOTP_ERR_TIMEOUT || rc_e == ISOTP_ERR_TIMEOUT)
+        {
+            printf("[demo] isotp timeout: tester=%d ecu=%d\n", rc_t, rc_e);
+            return -2;
+        }
 
         /* ecu 收到完整请求 -> 交给 UDS 处理 -> 发回响应 */
         if (!handled && isotp_recv(tp_e, buf, &len) == ISOTP_OK)
@@ -124,7 +148,9 @@ static int transact(can_driver_t *can_t, isotp_t *tp_t,
 
         usleep(1000);
     }
+    }
 
+    printf("[demo] transaction did not complete within 1s\n");
     return -1;
 }
 
@@ -133,8 +159,8 @@ int main(void)
     can_socketcan_t sk_tester, sk_ecu;
     can_driver_t can_tester, can_ecu;
     isotp_t tp_tester, tp_ecu;
-    isotp_config_t cfg_tester = {ID_REQUEST, ID_RESPONSE, 0, 0, 0};
-    isotp_config_t cfg_ecu = {ID_RESPONSE, ID_REQUEST, 8, 10, 0};
+    isotp_config_t cfg_tester = {ID_REQUEST, ID_RESPONSE, 0, 0, 0, 0, 0};
+    isotp_config_t cfg_ecu = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
     uint8_t resp[64];

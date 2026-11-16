@@ -61,7 +61,7 @@ static void test_single_frame_tx(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     can_frame_t out;
     const uint8_t payload[5] = {0x10, 0x03, 0x22, 0xF1, 0x90};
 
@@ -86,7 +86,7 @@ static void test_multi_frame_tx(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     can_frame_t out;
     uint8_t payload[20];
     int rc;
@@ -135,7 +135,7 @@ static void test_block_size(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     can_frame_t out;
     uint8_t payload[30];
     unsigned before;
@@ -172,7 +172,7 @@ static void test_fc_overflow(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     uint8_t payload[20];
     int rc;
 
@@ -196,7 +196,7 @@ static void test_single_frame_rx(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0};
+    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0, 0, 0};
     uint8_t msg[16];
     uint16_t len = 0;
     uint8_t d[5] = {0x03, 0x62, 0xF1, 0x90, 0xAA};
@@ -220,7 +220,7 @@ static void test_multi_frame_rx(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0};
+    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0, 0, 0};
     can_frame_t out;
     uint8_t msg[32];
     uint16_t len = 0;
@@ -279,7 +279,7 @@ static void test_sequence_error(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0};
+    isotp_config_t cfg = {0x7E8, 0x7E0, 8, 10, 0, 0, 0};
     uint8_t d[8];
     int rc;
 
@@ -309,7 +309,7 @@ static void test_limits(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     can_frame_t out;
     uint8_t d[8];
     static uint8_t huge[ISOTP_MAX_PAYLOAD + 1];
@@ -353,7 +353,7 @@ static void test_abort(void)
     can_stub_t stub;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0};
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
     uint8_t payload[20];
 
     printf("Abort\n");
@@ -368,6 +368,172 @@ static void test_abort(void)
     isotp_abort(&tp);
     check(isotp_tx_busy(&tp) == 0, "idle after abort");
     check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY, "can start again");
+}
+
+/*
+ * 超时：对端不发流控帧。
+ *
+ * 这一组测的是原来那个 bug 的根因：状态卡在 WAIT_FC 时没有任何退出路径，
+ * 于是「对端掉线一次」= 「本节点永久失去发送能力]。
+ */
+static void test_timeout_n_bs(void)
+{
+    can_stub_t stub;
+    can_driver_t can;
+    isotp_t tp;
+    /* N_Bs 显式给 300ms，让测试不用跨越大段时间 */
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 300, 0};
+    uint8_t payload[20];
+
+    printf("N_Bs timeout (peer never sends flow control)\n");
+
+    memset(payload, 0x55, sizeof(payload));
+    can_driver_init(&can, can_stub_ops(), &stub, 500000);
+    isotp_init(&tp, &cfg);
+
+    check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY, "multi-frame started");
+
+    /* now=0 是合法时间戳：计时器靠 timer_armed 起算，不能拿 0 当哨兵 */
+    check(isotp_poll_at(&tp, &can, 0) == ISOTP_BUSY, "t=0 accepted, timer armed");
+    check(isotp_poll_at(&tp, &can, 299) == ISOTP_BUSY, "299ms still within N_Bs");
+    check(isotp_poll_at(&tp, &can, 301) == ISOTP_ERR_TIMEOUT, "301ms -> timeout");
+
+    check(isotp_tx_busy(&tp) == 0, "tx state reset after timeout");
+
+    /*
+     * 核心断言。修复前这里会是 ISOTP_ERR_STATE：
+     * 状态卡在 WAIT_FC、调用方放弃循环、后续所有发送全部失败。
+     */
+    check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY,
+          "can start a new transfer right after timeout");
+}
+
+/* 超时：收到首帧后对端不再发连续帧 */
+static void test_timeout_n_cr(void)
+{
+    can_stub_t stub;
+    can_driver_t can;
+    isotp_t tp;
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 300};
+    can_frame_t out;
+    uint8_t ff[8] = {0x10, 20, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
+
+    printf("N_Cr timeout (peer stops sending consecutive frames)\n");
+
+    can_driver_init(&can, can_stub_ops(), &stub, 500000);
+    isotp_init(&tp, &cfg);
+
+    inject_frame(&stub, cfg.rx_id, ff, 8);
+    check(isotp_poll_at(&tp, &can, 0) == ISOTP_BUSY, "first frame accepted");
+    check(tp.rx.active == 1, "rx marked active");
+
+    check(can_stub_pop_tx(&stub, &out) == CAN_OK, "flow control returned");
+    check(out.data[0] == 0x30, "FC status is CTS");
+
+    /*
+     * 注意：没有新帧进来时 poll 返回 ISOTP_OK（"本次调用无事件"），
+     * 不是 BUSY。BUSY 表示"本次调用推进了传输"。
+     * 这里真正关心的是「没超时」，不是某个特定返回值。
+     */
+    check(isotp_poll_at(&tp, &can, 299) != ISOTP_ERR_TIMEOUT,
+          "299ms still within N_Cr");
+    check(isotp_poll_at(&tp, &can, 301) == ISOTP_ERR_TIMEOUT, "301ms -> timeout");
+    check(tp.rx.active == 0, "rx state cleared, half message not left behind");
+
+    /*
+     * 半个旧报文必须彻底清掉，否则新报文的首帧会被当成
+     * 「序号错乱」或「长度不符」而丢弃 —— 表现为对端恢复后仍然收不到数据。
+     */
+    inject_frame(&stub, cfg.rx_id, ff, 8);
+    check(isotp_poll_at(&tp, &can, 302) == ISOTP_BUSY,
+          "new first frame accepted after timeout");
+}
+
+/* 超时后完整恢复：不只状态字段对了，而是真的能发完一包 */
+static void test_recovery_after_timeout(void)
+{
+    can_stub_t stub;
+    can_driver_t can;
+    isotp_t tp;
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 300, 0};
+    uint8_t payload[20];
+
+    printf("Recovery: full transfer works after a timeout\n");
+
+    memset(payload, 0x77, sizeof(payload));
+    can_driver_init(&can, can_stub_ops(), &stub, 500000);
+    isotp_init(&tp, &cfg);
+
+    /* 第一轮：对端沉默，超时 */
+    isotp_send(&tp, &can, payload, 20);
+    isotp_poll_at(&tp, &can, 0);
+    check(isotp_poll_at(&tp, &can, 500) == ISOTP_ERR_TIMEOUT, "first attempt timed out");
+
+    /*
+     * 先清掉第一轮残留的 FF，再从干净队列开始第二轮。
+     * 顺序不能反：反过来会把第二轮刚发出的 FF 一起清掉。
+     */
+    {
+        can_frame_t junk;
+
+        while (can_stub_pop_tx(&stub, &junk) == CAN_OK)
+            ;
+    }
+
+    /* 对端恢复，第二轮必须完整跑完：FF -> FC -> CF -> CF */
+    check(isotp_send(&tp, &can, payload, 20) == ISOTP_BUSY, "second attempt starts");
+
+    isotp_poll_at(&tp, &can, 600);
+    inject_fc(&stub, cfg.rx_id, ISOTP_FS_CTS, 0, 0);
+
+    isotp_poll_at(&tp, &can, 610);
+    isotp_poll_at(&tp, &can, 620);
+    isotp_poll_at(&tp, &can, 630);
+
+    {
+        can_frame_t out;
+        uint8_t pci[4];
+        int n = 0;
+
+        while (n < 4 && can_stub_pop_tx(&stub, &out) == CAN_OK)
+            pci[n++] = out.data[0];
+
+        check(n == 3, "exactly FF + 2 CF on the bus");
+        check(n >= 1 && pci[0] == 0x10, "first frame is FF(len=20)");
+        check(n >= 2 && pci[1] == 0x21, "first CF has sequence 1");
+        check(n >= 3 && pci[2] == 0x22, "second CF has sequence 2");
+    }
+
+    check(isotp_tx_busy(&tp) == 0, "transfer completed after recovery");
+}
+
+/* 时间回绕：uint32 毫秒约 49.7 天绕一次，间隔判断必须仍然正确 */
+static void test_timeout_wraparound(void)
+{
+    can_stub_t stub;
+    can_driver_t can;
+    isotp_t tp;
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 300, 0};
+    uint8_t payload[20];
+    uint32_t t0 = 0xFFFFFF00u; /* 距上限 256ms */
+
+    printf("Timeout across uint32 millisecond wraparound\n");
+
+    memset(payload, 0x33, sizeof(payload));
+    can_driver_init(&can, can_stub_ops(), &stub, 500000);
+    isotp_init(&tp, &cfg);
+    isotp_send(&tp, &can, payload, 20);
+
+    check(isotp_poll_at(&tp, &can, t0) == ISOTP_BUSY, "armed before wraparound");
+    /* t0+200 还没绕；此时间隔 200ms < 300ms */
+    check(isotp_poll_at(&tp, &can, t0 + 200u) == ISOTP_BUSY, "200ms, no wrap yet");
+    /*
+     * t0+400 已经绕过 0：算出来是 144，远小于 t0。
+     * 无符号减法 (144 - 0xFFFFFF00) 仍得 400，所以超时判断正确。
+     * 如果实现里写成有符号比较或直接比大小，这里会判成「还没超时」。
+     */
+    check(isotp_poll_at(&tp, &can, t0 + 400u) == ISOTP_ERR_TIMEOUT,
+          "400ms across wrap -> timeout");
 }
 
 int main(void)
@@ -390,6 +556,14 @@ int main(void)
     test_limits();
     printf("\n");
     test_abort();
+    printf("\n");
+    test_timeout_n_bs();
+    printf("\n");
+    test_timeout_n_cr();
+    printf("\n");
+    test_recovery_after_timeout();
+    printf("\n");
+    test_timeout_wraparound();
 
     printf("\nResult: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
