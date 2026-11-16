@@ -160,8 +160,21 @@ int isotp_poll_at(isotp_t *tp, can_driver_t *can, uint32_t now_ms);
  */
 int isotp_poll(isotp_t *tp, can_driver_t *can);
 
-/* 取走已接收的完整报文，成功返回 ISOTP_OK 并写出长度 */
-int isotp_recv(isotp_t *tp, uint8_t *out, uint16_t *out_len);
+/*
+ * 取走已接收的完整报文，成功返回 ISOTP_OK 并写出长度。
+ *
+ * out_size 是调用方缓冲区的容量，**必须传**。
+ *
+ * 为什么加这个参数：早期版本没有容量检查，直接 memcpy。
+ * 调用方通常给一个按 UDS 常规请求准备的小缓冲（64 字节很常见），
+ * 而刷写时 0x36 的请求有几百字节 —— 于是写穿栈，覆盖调用方的局部变量。
+ * 实测表现是循环变量被改成别的值，进程「正常」退出，没有任何报错。
+ * 这种 bug 靠读代码很难发现，只有跑真实大包传输才会暴露。
+ *
+ * 放不下时：丢弃该报文并返回 ISOTP_ERR_OVERFLOW。
+ * 必须丢弃而不是留着 —— 否则调用方每次都会取到同一条超长报文，永远卡住。
+ */
+int isotp_recv(isotp_t *tp, uint8_t *out, uint16_t out_size, uint16_t *out_len);
 
 /* 是否有传输在进行中 */
 int isotp_tx_busy(const isotp_t *tp);

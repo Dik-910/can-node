@@ -202,10 +202,26 @@ int main(int argc, char **argv)
     can_socketcan_t sk;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
+    /*
+     * block_size=0 / stmin=0：不分块、不限速，对端可以连续发。
+     *
+     * 原来写 8 / 10ms，对几十字节的普通 UDS 请求没问题，
+     * 但在固件传输上会致命：一个 0x36 请求 256 字节 = 1 FF + 36 CF，
+     * 36 帧 × 10ms = 360ms，而 tester 的 P2（等响应）只有 50ms ——
+     * 数据还没发完，tester 已经判超时了。
+     *
+     * 真实项目里 STmin 要按总线负载留余量（1~2ms 常见），
+     * 这里为了联调速度取 0。接收侧靠主循环一次收干净来跟上。
+     */
+    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 0, 0, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
-    uint8_t req[64], resp[64];
+    /*
+     * 请求缓冲必须容得下最大的 0x36 请求（max_block_len = 256），
+     * 所以不能按「普通 UDS 请求 64 字节」来给。
+     * 响应侧同理留足余量（0x22 读多帧可能几十字节）。
+     */
+    uint8_t req[512], resp[512];
     uint16_t len = 0;
     int seconds = 30;
     const char *ifname = "vcan0";
@@ -246,9 +262,23 @@ int main(int argc, char **argv)
 
     for (int tick = 0; tick < seconds * 1000 && !g_stop; tick++)
     {
-        isotp_poll(&tp, &can);
+        /*
+         * 一次把当前可读的帧都处理掉，而不是每 tick 只推进一帧。
+         *
+         * 256 字节的 0x36 请求 = 1 个 FF + 36 个 CF。每 tick 收一帧的话，
+         * 收完要 37ms，而 tester 的 P2 是 50ms —— 刚好卡在边界上，
+         * 调度一抖就判超时。
+         *
+         * isotp_poll_at 返回正数表示「本次推进了」（BUSY / RX_COMPLETE），
+         * 0 表示没有更多帧，负数表示错误或超时 —— 后两种都该停下。
+         */
+        for (int step = 0; step < 64; step++)
+        {
+            if (isotp_poll_at(&tp, &can, now_ms32()) <= 0)
+                break;
+        }
 
-        if (isotp_recv(&tp, req, &len) == ISOTP_OK)
+        if (isotp_recv(&tp, req, sizeof(req), &len) == ISOTP_OK)
         {
             int rlen;
 

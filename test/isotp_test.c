@@ -208,10 +208,10 @@ static void test_single_frame_rx(void)
 
     inject_frame(&stub, cfg.rx_id, d, 5);
     check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "complete message received");
-    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "message popped");
+    check(isotp_recv(&tp, msg, sizeof(msg), &len) == ISOTP_OK, "message popped");
     check(len == 3, "length is 3");
     check(msg[0] == 0x62 && msg[2] == 0x90, "content matches");
-    check(isotp_recv(&tp, msg, &len) == ISOTP_ERR_NOMSG, "second pop returns NOMSG");
+    check(isotp_recv(&tp, msg, sizeof(msg), &len) == ISOTP_ERR_NOMSG, "second pop returns NOMSG");
 }
 
 /* 接收多帧：收到首帧要自动回流量控制，再拼连续帧 */
@@ -268,7 +268,7 @@ static void test_multi_frame_rx(void)
     }
     check(isotp_poll(&tp, &can) == ISOTP_RX_COMPLETE, "20 bytes assembled");
 
-    check(isotp_recv(&tp, msg, &len) == ISOTP_OK, "message popped");
+    check(isotp_recv(&tp, msg, sizeof(msg), &len) == ISOTP_OK, "message popped");
     check(len == 20, "length is 20");
     check(memcmp(msg, expect, 20) == 0, "content byte-exact");
 }
@@ -536,6 +536,65 @@ static void test_timeout_wraparound(void)
           "400ms across wrap -> timeout");
 }
 
+/*
+ * 取报文时缓冲区不够。
+ *
+ * 早期实现没有容量检查，直接 memcpy —— 刷写时 0x36 请求有几百字节，
+ * 而调用方往往只给了 64 字节，于是写穿栈、静默退出。
+ * 这里钉住两点：必须报错，且必须丢弃报文（否则调用方永远取不完）。
+ */
+static void test_recv_buffer_too_small(void)
+{
+    can_stub_t stub;
+    can_driver_t can;
+    isotp_t tp;
+    isotp_config_t cfg = {0x7E0, 0x7E8, 0, 0, 0, 0, 0};
+    uint8_t ff[8] = {0x10, 20, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    uint8_t cf1[8] = {0x21, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD};
+    uint8_t cf2[8] = {0x22, 0xEE, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t small[8];
+    uint8_t big[64];
+    uint16_t len = 0;
+
+    printf("Recv buffer too small\n");
+
+    can_driver_init(&can, can_stub_ops(), &stub, 500000);
+    isotp_init(&tp, &cfg);
+
+    /* 收齐一个 20 字节报文 */
+    inject_frame(&stub, cfg.rx_id, ff, 8);
+    isotp_poll_at(&tp, &can, 0);
+    inject_frame(&stub, cfg.rx_id, cf1, 8);
+    isotp_poll_at(&tp, &can, 1);
+    inject_frame(&stub, cfg.rx_id, cf2, 8);
+    check(isotp_poll_at(&tp, &can, 2) == ISOTP_RX_COMPLETE, "20-byte message complete");
+
+    /* 8 字节缓冲装不下 20 字节 */
+    check(isotp_recv(&tp, small, sizeof(small), &len) == ISOTP_ERR_OVERFLOW,
+          "too-small buffer -> OVERFLOW");
+    check(len == 0, "length not reported on overflow");
+
+    /*
+     * 报文必须已经被丢弃。
+     * 如果实现只是返回错误但没清 complete，调用方下次还会取到同一条，
+     * 换个大缓冲也救不回来 —— 表现为「永远在读同一条报文」。
+     */
+    check(isotp_recv(&tp, big, sizeof(big), &len) == ISOTP_ERR_NOMSG,
+          "message discarded after overflow");
+
+    /* 缓冲区够大时正常取走 */
+    inject_frame(&stub, cfg.rx_id, ff, 8);
+    isotp_poll_at(&tp, &can, 3);
+    inject_frame(&stub, cfg.rx_id, cf1, 8);
+    isotp_poll_at(&tp, &can, 4);
+    inject_frame(&stub, cfg.rx_id, cf2, 8);
+    isotp_poll_at(&tp, &can, 5);
+    check(isotp_recv(&tp, big, sizeof(big), &len) == ISOTP_OK, "large buffer works");
+    /* FF 带 6 字节（0x11..0x66），CF1 带 7（0x77..0xDD），所以 0xEE 在索引 13 */
+    check(len == 20 && big[0] == 0x11 && big[13] == 0xEE && big[14] == 0xFF,
+          "content intact");
+}
+
 int main(void)
 {
     printf("=== ISO-TP test ===\n\n");
@@ -564,6 +623,8 @@ int main(void)
     test_recovery_after_timeout();
     printf("\n");
     test_timeout_wraparound();
+    printf("\n");
+    test_recv_buffer_too_small();
 
     printf("\nResult: %d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

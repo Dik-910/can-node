@@ -447,12 +447,23 @@ int isotp_poll(isotp_t *tp, can_driver_t *can)
 }
 
 
-int isotp_recv(isotp_t *tp, uint8_t *out, uint16_t *out_len)
+int isotp_recv(isotp_t *tp, uint8_t *out, uint16_t out_size, uint16_t *out_len)
 {
     if (tp == 0 || out == 0 || out_len == 0)
         return ISOTP_ERR_PARAM;
     if (!tp->rx.complete)
         return ISOTP_ERR_NOMSG;
+
+    /*
+     * 容量检查。漏了这一步就是写穿栈：调用方给的缓冲常常只有几十字节
+     * （按普通 UDS 请求准备），而固件传输的 0x36 请求有几百字节。
+     */
+    if (tp->rx.complete_len > out_size)
+    {
+        tp->rx.complete = 0; /* 丢弃，否则下次还是同一条，调用方永远取不完 */
+        *out_len = 0;
+        return ISOTP_ERR_OVERFLOW;
+    }
 
     memcpy(out, tp->rx.data, tp->rx.complete_len);
     *out_len = tp->rx.complete_len;

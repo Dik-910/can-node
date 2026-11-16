@@ -168,13 +168,25 @@ int main(int argc, char **argv)
     can_socketcan_t sk;
     can_driver_t can;
     isotp_t tp;
-    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
+    /*
+     * block_size=0 / stmin=0：不分块、不限速，对端可以连续发。
+     *
+     * 原来写 8 / 10ms，对几十字节的普通 UDS 请求没问题，
+     * 但在固件传输上会致命：一个 0x36 请求 256 字节 = 1 FF + 36 CF，
+     * 36 帧 × 10ms = 360ms，而 tester 的 P2（等响应）只有 50ms ——
+     * 数据还没发完，tester 已经判超时了。
+     *
+     * 真实项目里 STmin 要按总线负载留余量（1~2ms 常见），
+     * 这里为了联调速度取 0。接收侧靠主循环一次收干净来跟上。
+     */
+    isotp_config_t cfg = {ID_RESPONSE, ID_REQUEST, 0, 0, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
     node_t node;
     node_health_t health;
     uint32_t last_scale = 1;
-    uint8_t req[64], resp[64];
+    /* 与 ECU 同理：要容得下最大的 0x36 请求，不能按 64 字节给 */
+    uint8_t req[512], resp[512];
     uint16_t len = 0;
     uint64_t last_tick;
     int seconds = 10;
@@ -278,8 +290,17 @@ int main(int argc, char **argv)
         }
 
         /* ---- 3. 诊断任务 ---- */
-        isotp_poll(&tp, &can);
-        if (isotp_recv(&tp, req, &len) == ISOTP_OK)
+        /*
+         * 一次收干净，不要每 tick 只推一帧。
+         * 固件传输的 0x36 请求有几百字节（1 FF + 几十个 CF），
+         * 按节拍慢慢收会顶着 tester 的 P2 超时。
+         */
+        for (int step = 0; step < 64; step++)
+        {
+            if (isotp_poll_at(&tp, &can, (uint32_t)now_ms()) <= 0)
+                break;
+        }
+        if (isotp_recv(&tp, req, sizeof(req), &len) == ISOTP_OK)
         {
             int rlen;
 

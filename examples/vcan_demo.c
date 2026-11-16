@@ -96,7 +96,7 @@ static int transact(can_driver_t *can_t, isotp_t *tp_t,
                     const uint8_t *req, uint16_t req_len,
                     uint8_t *resp, uint16_t *resp_len)
 {
-    uint8_t buf[64];
+    uint8_t buf[512];
     uint16_t len = 0;
     int handled = 0;
     int ret;
@@ -126,7 +126,7 @@ static int transact(can_driver_t *can_t, isotp_t *tp_t,
         }
 
         /* ecu 收到完整请求 -> 交给 UDS 处理 -> 发回响应 */
-        if (!handled && isotp_recv(tp_e, buf, &len) == ISOTP_OK)
+        if (!handled && isotp_recv(tp_e, buf, sizeof(buf), &len) == ISOTP_OK)
         {
             int rlen = uds_handle_request(srv, buf, len, resp, 64);
 
@@ -139,7 +139,7 @@ static int transact(can_driver_t *can_t, isotp_t *tp_t,
         }
 
         /* tester 收到完整响应 -> 结束 */
-        if (isotp_recv(tp_t, buf, &len) == ISOTP_OK)
+        if (isotp_recv(tp_t, buf, sizeof(buf), &len) == ISOTP_OK)
         {
             memcpy(resp, buf, len);
             *resp_len = len;
@@ -163,7 +163,7 @@ int main(void)
     isotp_config_t cfg_ecu = {ID_RESPONSE, ID_REQUEST, 8, 10, 0, 0, 0};
     uds_server_t srv;
     uds_config_t ucfg;
-    uint8_t resp[64];
+    uint8_t resp[512];
     uint16_t resp_len = 0;
 
     printf("=== vcan end-to-end demo ===\n");
