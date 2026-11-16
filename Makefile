@@ -12,13 +12,15 @@ dbc:
 	python3 -m cantools generate_c_source docs/can_matrix.dbc -o $(GEN)
 
 # PC 侧单元测试，不依赖硬件与 CAN 环境
-test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/uds_transfer_test test/uds_routine_test test/boot_test test/node_health_test
+test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/uds_transfer_test test/uds_routine_test test/uds_dtc_test test/dtc_test test/boot_test test/node_health_test
 	./test/can_matrix_test
 	./test/can_driver_test
 	./test/isotp_test
 	./test/uds_test
 	./test/uds_transfer_test
 	./test/uds_routine_test
+	./test/dtc_test
+	./test/uds_dtc_test
 	./test/boot_test
 	./test/node_health_test
 
@@ -32,22 +34,30 @@ test/isotp_test: test/isotp_test.c src/net/isotp.c src/can/can_driver.c src/can/
 	$(CC) $(CFLAGS) $^ -o $@
 
 clean:
-	$(RM) test/can_matrix_test test/can_driver_test test/isotp_test
+	$(RM) test/can_matrix_test test/can_driver_test test/isotp_test \
+	      test/uds_test test/uds_transfer_test test/uds_routine_test test/uds_dtc_test \
+	      test/dtc_test test/boot_test test/node_health_test
 
-test/uds_test: test/uds_test.c src/uds/uds.c
+test/uds_test: test/uds_test.c src/uds/uds.c src/uds/dtc.c
 	$(CC) $(CFLAGS) $^ -o $@
 
-test/uds_transfer_test: test/uds_transfer_test.c src/uds/uds.c
+test/uds_transfer_test: test/uds_transfer_test.c src/uds/uds.c src/uds/dtc.c
 	$(CC) $(CFLAGS) $^ -o $@
 
-test/uds_routine_test: test/uds_routine_test.c src/uds/uds.c
+test/uds_routine_test: test/uds_routine_test.c src/uds/uds.c src/uds/dtc.c
+
+test/uds_dtc_test: test/uds_dtc_test.c src/uds/uds.c src/uds/dtc.c
+	$(CC) $(CFLAGS) $^ -o $@
+
+test/dtc_test: test/dtc_test.c src/uds/dtc.c
+	$(CC) $(CFLAGS) $^ -o $@
 	$(CC) $(CFLAGS) $^ -o $@
 
 test/boot_test: test/boot_test.c src/boot/boot.c src/boot/boot_flash_ram.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 # vcan 端到端演示：需要真实 CAN 接口（sudo ip link add dev vcan0 type vcan）
-vcan-demo: examples/vcan_demo.c src/can/can_driver.c src/can/can_driver_socketcan.c src/net/isotp.c src/uds/uds.c
+vcan-demo: examples/vcan_demo.c src/can/can_driver.c src/can/can_driver_socketcan.c src/net/isotp.c src/uds/uds.c src/uds/dtc.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 .PHONY: vcan
@@ -66,8 +76,20 @@ flash-interop: ecu-server
 	 echo "--- ecu log ---"; tail -8 .ecu-flash.log; \
 	 exit $$RC
 
+# 故障码互操作：让 udsoncan 触发真实的 ISO-TP 超时，再读码 / 清码
+# 前置：vcan0 已建
+.PHONY: dtc-interop
+dtc-interop: ecu-server
+	@echo "--- starting ecu-server ---"
+	@./ecu-server --if vcan0 --seconds 30 > .ecu-dtc.log 2>&1 & \
+	 ECU=$$!; sleep 1; \
+	 python3 tools/dtc_interop.py; RC=$$?; \
+	 kill $$ECU 2>/dev/null; wait $$ECU 2>/dev/null; \
+	 echo "--- ecu log ---"; tail -6 .ecu-dtc.log; \
+	 exit $$RC
+
 # 常驻 ECU：供第三方 tester（udsoncan / can-utils）联调
-ecu-server: examples/ecu_server.c src/can/can_driver.c src/can/can_driver_socketcan.c src/net/isotp.c src/uds/uds.c
+ecu-server: examples/ecu_server.c src/can/can_driver.c src/can/can_driver_socketcan.c src/net/isotp.c src/uds/uds.c src/uds/dtc.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 # 总线时序分析（纯计算，不依赖 CAN 接口）
@@ -77,7 +99,7 @@ bus-load: examples/bus_load_test.c
 
 # 完整节点：周期报文 + 诊断响应，用 DBC 生成的打包函数
 node: examples/node_main.c src/can/can_driver.c src/can/can_driver_socketcan.c src/app/node_health.c \
-      src/can/generated/can_matrix.c src/net/isotp.c src/uds/uds.c
+      src/can/generated/can_matrix.c src/net/isotp.c src/uds/uds.c src/uds/dtc.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 test/node_health_test: test/node_health_test.c src/app/node_health.c

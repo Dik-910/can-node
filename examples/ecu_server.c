@@ -197,6 +197,65 @@ static uint32_t now_ms32(void)
     return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000));
 }
 
+/* ---------------- 故障码 ---------------- */
+
+/*
+ * 本 ECU 只有一个真实可检测的故障：诊断通信超时。
+ *
+ * 触发路径是完全真实的 —— tester 发了首帧却不发连续帧（或者中途拔线），
+ * ISO-TP 的 N_Cr 计时器到点后判定超时，这里记一条 DTC。
+ * 不是插桩造出来的假故障，所以 0x19 读出来的东西有实际意义。
+ */
+#define DTC_DIAG_TIMEOUT 0xC10087u
+
+static const dtc_def_t g_dtc_defs[] = {
+    {DTC_DIAG_TIMEOUT, "diagnostic response timeout"},
+};
+
+static dtc_store_t g_dtcs;
+static uint32_t g_boot_ms;
+static int g_last_isotp_rc;
+
+/*
+ * 快照：故障那一刻的工况。
+ *
+ * 内容按 ISO 14229 的 DTCSnapshotRecord 组织：
+ *   [DID 个数][DID(2)][数据...]
+ *
+ * 这里必须带「DID 个数」这一字节 —— 通用 tester 靠它知道后面有几组
+ * 键值对，少了它 udsoncan 会直接判「record 里没有 DID」并抛
+ * InvalidResponseException。这个坑只有拿别人的栈来读才会暴露，
+ * 自测时自己的解析器怎么写都能对上。
+ *
+ * 用 DID 组织而不是裸字节，是为了让工具能按 DID 各自的编码解码，
+ * 否则读出来只能看到一串十六进制。
+ *
+ * 存运行时长而不是墙钟时间：车上的 ECU 没有 RTC，只有上电计时。
+ */
+#define DID_FAULT_CONTEXT 0x0001u
+
+static int snap_provider(uint32_t code, uint8_t *out, uint8_t max_len)
+{
+    uint32_t up;
+
+    (void)code;
+
+    if (max_len < 8)
+        return 0;
+
+    up = now_ms32() - g_boot_ms;
+    out[0] = 1; /* 只有一组 DID */
+    out[1] = (uint8_t)(DID_FAULT_CONTEXT >> 8);
+    out[2] = (uint8_t)(DID_FAULT_CONTEXT & 0xFF);
+    out[3] = (uint8_t)(up & 0xFF);
+    out[4] = (uint8_t)((up >> 8) & 0xFF);
+    out[5] = (uint8_t)((up >> 16) & 0xFF);
+    out[6] = (uint8_t)((up >> 24) & 0xFF);
+    /* 负的错误码按位截断，看到 0xF8 就是 ISOTP_ERR_TIMEOUT(-8) */
+    out[7] = (uint8_t)g_last_isotp_rc;
+    return 8;
+}
+
 int main(int argc, char **argv)
 {
     can_socketcan_t sk;
@@ -254,7 +313,24 @@ int main(int argc, char **argv)
     ucfg.dids = g_dids;
     ucfg.did_count = (uint16_t)(sizeof(g_dids) / sizeof(g_dids[0]));
     ucfg.mem = &g_memif;
+
+    /* 诊断仪读码要有地方读，先把这个 ECU 的故障存储器立起来 */
+    {
+        dtc_config_t dcfg;
+
+        memset(&dcfg, 0, sizeof(dcfg));
+        dcfg.defs = g_dtc_defs;
+        dcfg.def_count = (uint16_t)(sizeof(g_dtc_defs) / sizeof(g_dtc_defs[0]));
+        dtc_init(&g_dtcs, &dcfg);
+        dtc_set_snapshot_provider(&g_dtcs, snap_provider);
+        /* 上电即进入第 1 个操作循环，老化计数从这里开始数 */
+        dtc_operation_cycle(&g_dtcs);
+    }
+
+    ucfg.dtcs = &g_dtcs;
     uds_init(&srv, &ucfg);
+
+    g_boot_ms = now_ms32();
 
     printf("[ecu] listening on %s, req=0x%03X rsp=0x%03X, %d s\n",
            ifname, ID_REQUEST, ID_RESPONSE, seconds);
@@ -274,9 +350,20 @@ int main(int argc, char **argv)
          */
         for (int step = 0; step < 64; step++)
         {
-            if (isotp_poll_at(&tp, &can, now_ms32()) <= 0)
+            g_last_isotp_rc = isotp_poll_at(&tp, &can, now_ms32());
+            if (g_last_isotp_rc <= 0)
                 break;
         }
+
+        /*
+         * 超时就是一次真实的通信故障。
+         *
+         * 只有超时才记，别的错误码（序号错、溢出）是 tester 自己发错了帧，
+         * 属于对端的问题，不该记到本 ECU 的故障存储里 ——
+         * 否则任何人拿 can-utils 乱发几帧就能把 ECU 刷成满屏故障。
+         */
+        dtc_report(&g_dtcs, DTC_DIAG_TIMEOUT, g_last_isotp_rc == ISOTP_ERR_TIMEOUT,
+                   now_ms32());
 
         if (isotp_recv(&tp, req, sizeof(req), &len) == ISOTP_OK)
         {
@@ -328,8 +415,16 @@ int main(int argc, char **argv)
                  * 超时由 ISO-TP 自己判断，见 isotp.h 里关于 N_Bs 的说明。 */
                 while (isotp_tx_busy(&tp))
                 {
-                    if (isotp_poll_at(&tp, &can, now_ms32()) == ISOTP_ERR_TIMEOUT)
+                    int rc = isotp_poll_at(&tp, &can, now_ms32());
+
+                    if (rc == ISOTP_ERR_TIMEOUT)
                     {
+                        /*
+                         * 响应发不出去同样算通信故障：tester 要了响应却不给流控，
+                         * 这一条和收方向的超时是同一类问题，共用同一个码。
+                         */
+                        g_last_isotp_rc = rc;
+                        dtc_report(&g_dtcs, DTC_DIAG_TIMEOUT, 1, now_ms32());
                         printf("[ecu] tx timeout, transfer aborted\n");
                         break;
                     }

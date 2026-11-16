@@ -35,5 +35,5 @@ Thumbs.db
 /ecu-server
 /bus-load
 /node
-/.ecu-flash.log
+/.ecu-*.log
 /.dbg/

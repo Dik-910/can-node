@@ -70,3 +70,19 @@ jobs:
           # 块大小协商：服务端必须回报可用的块长度
           grep -q "server reported a block length" /tmp/flash.log
           echo "flash interop verified"
+
+      # 故障码服务：让第三方栈触发真实的 ISO-TP 超时，再读码 / 读快照 / 清码
+      - name: DTC interop over vcan
+        run: |
+          make dtc-interop | tee /tmp/dtc.log
+
+          grep -qE "Result: [0-9]+ passed, 0 failed" /tmp/dtc.log
+          # 故障必须是被协议栈自己检测出来的，不能是插桩造的
+          grep -q "timeout produces a DTC" /tmp/dtc.log
+          # 一次超时只能到 pending，不能直接 confirmed
+          grep -q "a single timeout stays unconfirmed" /tmp/dtc.log
+          # 快照要能被通用 tester 按 DID 解出来
+          grep -q "one DID decoded from the snapshot record" /tmp/dtc.log
+          # 清码必须有会话门槛
+          grep -q "clear in default session -> NRC 0x22" /tmp/dtc.log
+          echo "dtc interop verified"

@@ -5,7 +5,7 @@
 /*
  * UDS 服务层实现。
  *
- * 分派方式用 switch 而不是函数指针表：服务只有六个，加一层间接反而更难读。
+ * 分派方式用 switch 而不是函数指针表：服务只有十来个，加一层间接反而更难读。
  * 参考实现（driftregion/iso14229）走的是「单入口事件回调」，适合库作者；
  * 我们是自己写业务，switch 更直接。
  *
@@ -820,6 +820,254 @@ static int handle_transfer_exit(uds_server_t *srv, const uint8_t *req, uint16_t 
 }
 
 
+/* ---------------- 0x19 / 0x14 故障码 ---------------- */
+
+/*
+ * 往响应缓冲里追加，越界就整体失败。
+ *
+ * 0x19 02 的响应长度取决于故障条数，是唯一一个「长度不确定」的服务。
+ * 每追加一段都查边界，比事先算长度更不容易算错。
+ */
+static int append(uint8_t *resp, uint16_t size, uint16_t *pos,
+                  const uint8_t *data, uint16_t n)
+{
+    if ((uint32_t)*pos + n > size)
+        return -1;
+
+    if (n > 0)
+        memcpy(resp + *pos, data, n);
+    *pos = (uint16_t)(*pos + n);
+    return 0;
+}
+
+static void put_dtc(uint8_t *out, uint32_t code)
+{
+    out[0] = (uint8_t)((code >> 16) & 0xFF);
+    out[1] = (uint8_t)((code >> 8) & 0xFF);
+    out[2] = (uint8_t)(code & 0xFF);
+}
+
+static uint32_t get_dtc(const uint8_t *in)
+{
+    return ((uint32_t)in[0] << 16) | ((uint32_t)in[1] << 8) | in[2];
+}
+
+static int read_dtc_number(uds_server_t *srv, uint8_t *resp, uint16_t size,
+                           const uint8_t *req)
+{
+    uint16_t n = dtc_count_by_mask(srv->cfg.dtcs, req[2]);
+    uint16_t pos = 0;
+    uint8_t head[6];
+
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = UDS_DTC_REPORT_NUMBER_BY_MASK;
+    head[2] = DTC_STATUS_AVAILABILITY_MASK;
+    head[3] = UDS_DTC_FORMAT_ISO14229;
+    head[4] = (uint8_t)(n >> 8);
+    head[5] = (uint8_t)(n & 0xFF);
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+
+    return (int)pos;
+}
+
+static int read_dtc_list(uds_server_t *srv, uint8_t *resp, uint16_t size,
+                         const uint8_t *req, uint8_t sub)
+{
+    uint16_t pos = 0;
+    uint8_t head[3];
+
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = sub;
+    head[2] = DTC_STATUS_AVAILABILITY_MASK;
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+
+    for (uint16_t i = 0; i < srv->cfg.dtcs->count; i++)
+    {
+        const dtc_entry_t *e = dtc_get(srv->cfg.dtcs, i);
+        uint8_t item[4];
+
+        if (e == 0)
+            continue;
+
+        /*
+         * 0x0A 要的是「支持的全部码」，不看状态；
+         * 0x02 只看掩码命中的。这是两个服务唯一的差别，
+         * 混用会让 tester 在无故障时读到一堆 CDTC=0 的条目。
+         */
+        if (sub == UDS_DTC_REPORT_BY_MASK && (e->status & req[2]) == 0)
+            continue;
+
+        put_dtc(item, e->code);
+        item[3] = e->status;
+
+        if (append(resp, size, &pos, item, sizeof(item)) != 0)
+            return -1;
+    }
+
+    return (int)pos;
+}
+
+static int read_dtc_snapshot(uds_server_t *srv, uint8_t *resp, uint16_t size,
+                             const uint8_t *req)
+{
+    const dtc_entry_t *e = dtc_find(srv->cfg.dtcs, get_dtc(&req[2]));
+    uint16_t pos = 0;
+    uint8_t head[7];
+
+    /*
+     * 三种「没有」都返回 0x31：码不存在、记录号不对、该码没有快照。
+     * 协议允许更细的 NRC，但 tester 对 0x31 的处理最一致，
+     * 强行区分反而会在不同工具上出现兼容问题。
+     */
+    if (e == 0)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+    if (req[5] != UDS_DTC_RECORD_ALL && req[5] != UDS_DTC_RECORD_SNAPSHOT)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+    if (!e->has_snapshot)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    /* 59 04 <DTC3> <status> <recordNumber> <snapshot...> */
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = UDS_DTC_REPORT_SNAPSHOT;
+    put_dtc(&head[2], e->code);
+    head[5] = e->status;
+    head[6] = UDS_DTC_RECORD_SNAPSHOT; /* 回填规范记录号，不回 0xFF */
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+    if (append(resp, size, &pos, e->snapshot, e->snapshot_len) != 0)
+        return -1;
+
+    return (int)pos;
+}
+
+static int read_dtc_ext_data(uds_server_t *srv, uint8_t *resp, uint16_t size,
+                             const uint8_t *req)
+{
+    const dtc_entry_t *e = dtc_find(srv->cfg.dtcs, get_dtc(&req[2]));
+    uint16_t pos = 0;
+    uint8_t head[7];
+    uint8_t ext[10];
+
+    if (e == 0)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+    if (req[5] != UDS_DTC_RECORD_ALL && req[5] != UDS_DTC_RECORD_EXT)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    /* 59 06 <DTC3> <status> <recordNumber> <extData...> */
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = UDS_DTC_REPORT_EXT_DATA;
+    put_dtc(&head[2], e->code);
+    head[5] = e->status;
+    head[6] = UDS_DTC_RECORD_EXT;
+
+    /*
+     * 扩展数据记录 0x01，厂商自定义格式，本实现固定 10 字节：
+     *   发生次数(1) + 老化进度(1) + 首次发生时刻(4, 小端) + 最近发生时刻(4, 小端)
+     * 时刻是调用方给的时间基准，单位毫秒，不保证是绝对时间。
+     */
+    ext[0] = e->occurrence;
+    ext[1] = e->aging_cycles;
+    ext[2] = (uint8_t)(e->first_ms & 0xFF);
+    ext[3] = (uint8_t)((e->first_ms >> 8) & 0xFF);
+    ext[4] = (uint8_t)((e->first_ms >> 16) & 0xFF);
+    ext[5] = (uint8_t)((e->first_ms >> 24) & 0xFF);
+    ext[6] = (uint8_t)(e->last_ms & 0xFF);
+    ext[7] = (uint8_t)((e->last_ms >> 8) & 0xFF);
+    ext[8] = (uint8_t)((e->last_ms >> 16) & 0xFF);
+    ext[9] = (uint8_t)((e->last_ms >> 24) & 0xFF);
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+    if (append(resp, size, &pos, ext, sizeof(ext)) != 0)
+        return -1;
+
+    return (int)pos;
+}
+
+static int handle_read_dtc(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                           uint8_t *resp, uint16_t size)
+{
+    uint8_t sub;
+
+    if (srv->cfg.dtcs == 0)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_SERVICE_NOT_SUPPORTED);
+
+    if (len < 2)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+
+    /* 0x19 的子功能不支持「抑制正响应」，最高位不是有效标志位，直接掩掉 */
+    sub = (uint8_t)(req[1] & 0x7Fu);
+
+    switch (sub)
+    {
+    case UDS_DTC_REPORT_NUMBER_BY_MASK:
+        if (len != 3)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_number(srv, resp, size, req);
+
+    case UDS_DTC_REPORT_BY_MASK:
+        if (len != 3)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_list(srv, resp, size, req, sub);
+
+    case UDS_DTC_REPORT_SNAPSHOT:
+        if (len != 6)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_snapshot(srv, resp, size, req);
+
+    case UDS_DTC_REPORT_EXT_DATA:
+        if (len != 6)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_ext_data(srv, resp, size, req);
+
+    case UDS_DTC_REPORT_SUPPORTED:
+        if (len != 2)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_list(srv, resp, size, req, sub);
+
+    default:
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_SUB_FUNCTION_INVALID);
+    }
+}
+
+static int handle_clear_dtc(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                            uint8_t *resp, uint16_t size)
+{
+    uint32_t group;
+
+    if (srv->cfg.dtcs == 0)
+        return send_negative(resp, size, UDS_SID_CLEAR_DTC, UDS_NRC_SERVICE_NOT_SUPPORTED);
+
+    if (len != 4)
+        return send_negative(resp, size, UDS_SID_CLEAR_DTC, UDS_NRC_INCORRECT_LENGTH);
+
+    /*
+     * 要求扩展会话。
+     *
+     * 有人会说默认会话也该能清 —— 那样任何接上总线的设备都能把历史故障
+     * 抹掉，售后就查不到真因了。宁可让 tester 多走一步 0x10 03。
+     */
+    if (!session_allows(srv, UDS_SESSION_EXTENDED))
+        return send_negative(resp, size, UDS_SID_CLEAR_DTC, UDS_NRC_CONDITIONS_NOT_CORRECT);
+
+    group = get_dtc(&req[1]);
+
+    if (dtc_clear(srv->cfg.dtcs, group) < 0)
+        return send_negative(resp, size, UDS_SID_CLEAR_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    if (size < 1)
+        return -1;
+
+    resp[0] = UDS_SID_CLEAR_DTC + POS_OFFSET;
+    return 1;
+}
+
+
 /* ---------------- 对外接口 ---------------- */
 
 int uds_init(uds_server_t *srv, const uds_config_t *cfg)
@@ -860,6 +1108,10 @@ int uds_handle_request(uds_server_t *srv, const uint8_t *req, uint16_t req_len,
         return handle_session_control(srv, req, req_len, resp, resp_size);
     case UDS_SID_ECU_RESET:
         return handle_ecu_reset(srv, req, req_len, resp, resp_size);
+    case UDS_SID_CLEAR_DTC:
+        return handle_clear_dtc(srv, req, req_len, resp, resp_size);
+    case UDS_SID_READ_DTC:
+        return handle_read_dtc(srv, req, req_len, resp, resp_size);
     case UDS_SID_READ_DATA:
         return handle_read_data(srv, req, req_len, resp, resp_size);
     case UDS_SID_SECURITY_ACCESS:

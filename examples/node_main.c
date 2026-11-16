@@ -74,10 +74,62 @@ typedef struct
     uint64_t start_ms;
 } node_t;
 
+/* ---------------- 故障码 ---------------- */
+
+/*
+ * 本节点的故障全部来自总线健康状态，三条都能被 node_health 真实检测到，
+ * 没有一条是「占位」的。
+ *
+ * 码的高两位是 11（网络类），和 0xC0xxxx 这种常见的通信故障编码风格一致。
+ */
+#define DTC_BUS_OFF       0xC00187u /* 总线关闭 */
+#define DTC_ERROR_PASSIVE 0xC00287u /* 错误被动，TEC 偏高 */
+#define DTC_BUS_STUCK     0xC00387u /* 反复 Bus Off，判定为硬件问题 */
+
+static const dtc_def_t g_dtc_defs[] = {
+    {DTC_BUS_OFF, "can bus off"},
+    {DTC_ERROR_PASSIVE, "can error passive"},
+    {DTC_BUS_STUCK, "can bus stuck / wiring fault"},
+};
+
+static dtc_store_t g_dtcs;
+
+/* 快照要读节点状态，回调没有 ctx 参数，所以用文件级指针挂上去 */
+static const node_health_t *g_snap_health;
+static const node_t *g_snap_node;
+
+/*
+ * 快照按 ISO 14229 的 DTCSnapshotRecord 组织：[DID 个数][DID(2)][数据...]，
+ * 和 ecu_server 保持一致。「DID 个数」那一字节不能省 —— 通用 tester
+ * 靠它判断后面有几组键值对。
+ */
+#define DID_FAULT_CONTEXT 0x0001u
+
+static int snap_provider(uint32_t code, uint8_t *out, uint8_t max_len)
+{
+    (void)code;
+
+    if (max_len < 10 || g_snap_health == 0 || g_snap_node == 0)
+        return 0;
+
+    out[0] = 1; /* 只有一组 DID */
+    out[1] = (uint8_t)(DID_FAULT_CONTEXT >> 8);
+    out[2] = (uint8_t)(DID_FAULT_CONTEXT & 0xFF);
+    out[3] = g_snap_health->state;
+    out[4] = g_snap_health->last_tec;
+    out[5] = (uint8_t)(g_snap_health->busoff_total & 0xFF);
+    out[6] = (uint8_t)((g_snap_health->busoff_total >> 8) & 0xFF);
+    out[7] = g_snap_node->err_level;
+    out[8] = (uint8_t)(g_snap_node->uptime_s & 0xFF);
+    out[9] = (uint8_t)((g_snap_node->uptime_s >> 8) & 0xFF);
+    return 10;
+}
+
 /* ---------------- 诊断用假数据 ---------------- */
 
 static uint16_t g_voltage_mv = 3660;
 static uint8_t g_threshold = 50;
+
 static const uint8_t g_vin[17] = {'L', 'S', 'V', 'A', 'A', '1', '2', '3', '4',
                                   '5', '6', '7', '8', '9', '0', 'A', 'B'};
 
@@ -185,6 +237,7 @@ int main(int argc, char **argv)
     node_t node;
     node_health_t health;
     uint32_t last_scale = 1;
+    uint8_t prev_health = HEALTH_NORMAL;
     /* 与 ECU 同理：要容得下最大的 0x36 请求，不能按 64 字节给 */
     uint8_t req[512], resp[512];
     uint16_t len = 0;
@@ -216,6 +269,24 @@ int main(int argc, char **argv)
     memset(&ucfg, 0, sizeof(ucfg));
     ucfg.dids = g_dids;
     ucfg.did_count = (uint16_t)(sizeof(g_dids) / sizeof(g_dids[0]));
+
+    /*
+     * 故障存储器挂在 UDS 配置上，0x19 / 0x14 才有东西可读可清。
+     * 不挂的话这两个服务会回 NRC 0x11 —— 那才是诚实的做法，
+     * 不支持的节点不该假装支持。
+     */
+    {
+        dtc_config_t dcfg;
+
+        memset(&dcfg, 0, sizeof(dcfg));
+        dcfg.defs = g_dtc_defs;
+        dcfg.def_count = (uint16_t)(sizeof(g_dtc_defs) / sizeof(g_dtc_defs[0]));
+        dtc_init(&g_dtcs, &dcfg);
+        dtc_set_snapshot_provider(&g_dtcs, snap_provider);
+        dtc_operation_cycle(&g_dtcs); /* 上电进入第 1 个操作循环 */
+    }
+    ucfg.dtcs = &g_dtcs;
+
     uds_init(&srv, &ucfg);
 
     memset(&node, 0, sizeof(node));
@@ -226,6 +297,8 @@ int main(int argc, char **argv)
     last_tick = node.start_ms;
 
     node_health_init(&health);
+    g_snap_health = &health;
+    g_snap_node = &node;
 
     printf("[node] running %d s: 0x%03X/%dms, 0x%03X/%dms, diag 0x%03X<->0x%03X\n",
            seconds, ID_NODE_STATUS, PERIOD_STATUS_MS, ID_BUS_STATUS, PERIOD_BUS_MS,
@@ -254,6 +327,36 @@ int main(int argc, char **argv)
                 node_health_update(&health, &st, (uint32_t)(now - last_tick));
                 node.err_level = (uint8_t)st.level;
                 node.busoff_cnt = (uint16_t)st.busoff_count;
+            }
+
+            /*
+             * 把总线状态翻译成故障码。
+             *
+             * 每个循环都要调，通过也要调 —— 不调的话这一层不知道「测过了」，
+             * 老化了永远不推进，故障会一直挂在那里。
+             */
+            {
+                uint32_t now32 = (uint32_t)(now - node.start_ms);
+
+                dtc_report(&g_dtcs, DTC_BUS_OFF,
+                           health.state == HEALTH_BUSOFF, now32);
+                dtc_report(&g_dtcs, DTC_ERROR_PASSIVE,
+                           health.state == HEALTH_DEGRADED, now32);
+                dtc_report(&g_dtcs, DTC_BUS_STUCK,
+                           health.long_degraded, now32);
+
+                /*
+                 * Bus Off 恢复视为一次操作循环的边界。
+                 *
+                 * 依据不是「凑一个循环」，而是 Bus Off 恢复时控制器确实做了
+                 * 一次重新初始化并重新参与仲裁 —— 通信栈是从零开始的。
+                 * 一个上电周期里反复 Bus Off，只有按这个边界切分，
+                 * 「偶发一次」和「每恢复一次就再挂」才能被区分出来。
+                 */
+                if (prev_health == HEALTH_BUSOFF && health.state != HEALTH_BUSOFF)
+                    dtc_operation_cycle(&g_dtcs);
+
+                prev_health = health.state;
             }
 
             scale = node_health_period_scale(&health);

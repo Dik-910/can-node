@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "dtc.h"
+
 /*
  * UDS 服务层（ISO 14229-1 子集）
  *
@@ -13,6 +15,8 @@
  * 已实现的服务：
  *   0x10 会话控制     默认 / 编程 / 扩展
  *   0x11 ECU 复位     需要调用方提供复位动作
+ *   0x14 清故障码     清除故障存储器，需扩展会话
+ *   0x19 读故障码     按状态掩码读、读快照、读扩展数据、读支持列表
  *   0x22 读数据       按 DID 读，支持一次请求多个 DID
  *   0x27 安全访问     种子-密钥，带失败次数限制与锁定
  *   0x2E 写数据       按 DID 写，需扩展会话 + 已解锁
@@ -26,6 +30,8 @@
 /* 服务号 */
 #define UDS_SID_SESSION_CONTROL 0x10
 #define UDS_SID_ECU_RESET       0x11
+#define UDS_SID_CLEAR_DTC       0x14
+#define UDS_SID_READ_DTC        0x19
 #define UDS_SID_READ_DATA       0x22
 #define UDS_SID_SECURITY_ACCESS 0x27
 #define UDS_SID_WRITE_DATA      0x2E
@@ -56,8 +62,31 @@
 #define UDS_NRC_REQUIRED_TIME_DELAY    0x37 /* 还在锁定冷却期 */
 #define UDS_NRC_RESPONSE_PENDING       0x78 /* 处理中，请稍等 */
 
-/* 时间参数（毫秒） */
-#define UDS_S3_TIMEOUT_MS 5000  /* 非默认会话的心跳超时 */
+/*
+ * 0x19 的子功能。ISO 14229-1 定义了十来个，这里实现诊断仪实际会用到的五个，
+ * 其余返回 NRC 0x12 —— 不假装支持，否则 tester 会拿到空数据以为 ECU 正常。
+ *
+ *   0x01 按状态掩码报数量    产线快速判断「有没有故障」
+ *   0x02 按状态掩码报列表    最常用，售后读码就是它
+ *   0x04 按 DTC 读快照      故障发生时的工况，用于复现
+ *   0x06 按 DTC 读扩展数据  发生次数、老化进度
+ *   0x0A 报支持的 DTC       告诉 tester 本 ECU 一共能报哪些码
+ */
+#define UDS_DTC_REPORT_NUMBER_BY_MASK 0x01
+#define UDS_DTC_REPORT_BY_MASK        0x02
+#define UDS_DTC_REPORT_SNAPSHOT       0x04
+#define UDS_DTC_REPORT_EXT_DATA       0x06
+#define UDS_DTC_REPORT_SUPPORTED      0x0A
+
+/* 记录号。0x01 是唯一一条记录，0xFF 表示「全部记录」，行为等同 0x01 */
+#define UDS_DTC_RECORD_SNAPSHOT 0x01
+#define UDS_DTC_RECORD_EXT      0x01
+#define UDS_DTC_RECORD_ALL      0xFF
+
+/* DTC 格式标识：0x01 = ISO 14229-1 定义的 3 字节码 */
+#define UDS_DTC_FORMAT_ISO14229 0x01
+
+/* 时间参数（毫秒） */#define UDS_S3_TIMEOUT_MS 5000  /* 非默认会话的心跳超时 */
 #define UDS_P2_MS         50    /* 收到请求到开始响应的最大时间 */
 #define UDS_P2_STAR_MS    5000  /* 发 NRC 0x78 后允许的延长 */
 #define UDS_MAX_ATTEMPTS  3     /* 安全访问允许的连续失败次数 */
@@ -210,6 +239,14 @@ typedef struct
      */
     const uds_routine_entry_t *routines;
     uint16_t routine_count;
+
+    /*
+     * 故障存储器。为 NULL 时 0x19 / 0x14 返回 NRC 0x11。
+     *
+     * 这里存的是指针而不是内嵌结构：故障存储器要跨复位保持（真实项目存
+     * EEPROM/NVM），生命周期比 uds_server_t 长，不能被它一起清掉。
+     */
+    dtc_store_t *dtcs;
 } uds_config_t;
 
 typedef struct
