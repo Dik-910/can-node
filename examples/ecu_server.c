@@ -69,10 +69,115 @@ static int write_threshold(const uint8_t *in, uint8_t len)
     return 0;
 }
 
+/* ---------------- 固件区模拟（供 0x34/0x36/0x37 刷写） ---------------- */
+
+#define FLASH_BASE 0x08000000u
+#define FLASH_SIZE (64u * 1024u)
+
+static uint8_t g_flash[FLASH_SIZE];
+static uint32_t g_flash_len;   /* 本次 0x34 声明的长度 */
+static uint32_t g_flash_crc;   /* 0x37 之后算出的 CRC32 */
+
+/* 位运算 CRC32，与 src/boot/boot.c 的算法一致（多项式 0xEDB88320） */
+static uint32_t crc32_of(const uint8_t *data, uint32_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+
+    for (uint32_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+
+    return ~crc;
+}
+
+static int flash_write(void *ctx, uint32_t addr, const uint8_t *d, uint16_t len)
+{
+    uint32_t off;
+    (void)ctx;
+
+    if (addr < FLASH_BASE)
+        return -1;
+
+    off = addr - FLASH_BASE;
+    if (off + len > FLASH_SIZE)
+        return -1;
+
+    /* 只能 1 -> 0：未擦除区域写不进去，和真实 Flash 一致 */
+    for (uint16_t i = 0; i < len; i++)
+    {
+        if ((g_flash[off + i] & d[i]) != d[i])
+            return -1;
+    }
+
+    memcpy(&g_flash[off], d, len);
+    return 0;
+}
+
+static int flash_read(void *ctx, uint32_t addr, uint8_t *d, uint16_t len)
+{
+    uint32_t off;
+    (void)ctx;
+
+    if (addr < FLASH_BASE)
+        return -1;
+
+    off = addr - FLASH_BASE;
+    if (off + len > FLASH_SIZE)
+        return -1;
+
+    memcpy(d, &g_flash[off], len);
+    return 0;
+}
+
+static int flash_erase(void *ctx, uint32_t addr, uint32_t len)
+{
+    uint32_t off;
+    (void)ctx;
+
+    if (addr < FLASH_BASE)
+        return -1;
+
+    off = addr - FLASH_BASE;
+    if (off + len > FLASH_SIZE)
+        return -1;
+
+    memset(&g_flash[off], 0xFF, len);
+    return 0;
+}
+
+static const uds_memory_t g_memif = {
+    flash_write, flash_read, flash_erase, 0, FLASH_BASE, FLASH_SIZE
+};
+
+/*
+ * DID 0x0301：返回 (CRC32, 长度)，各 4 字节大端。
+ *
+ * 为什么要暴露这个：刷完之后总得有个办法证明「写进去的字节是对的」。
+ * 用标准 0x22 读摘要，测试脚本就能拿自己算的 CRC 比对，
+ * 不依赖日志解析，也不依赖内部状态。
+ */
+static int read_flash_digest(uint8_t *out, uint8_t *out_len)
+{
+    out[0] = (uint8_t)(g_flash_crc >> 24);
+    out[1] = (uint8_t)(g_flash_crc >> 16);
+    out[2] = (uint8_t)(g_flash_crc >> 8);
+    out[3] = (uint8_t)g_flash_crc;
+    out[4] = (uint8_t)(g_flash_len >> 24);
+    out[5] = (uint8_t)(g_flash_len >> 16);
+    out[6] = (uint8_t)(g_flash_len >> 8);
+    out[7] = (uint8_t)g_flash_len;
+    *out_len = 8;
+    return 0;
+}
+
 static const uds_did_entry_t g_dids[] = {
     {0xF190, 17, g_vin, 0, 0, UDS_SESSION_DEFAULT, 0},  /* VIN，17 字节走多帧 */
     {0x0101, 0, 0, read_voltage, 0, UDS_SESSION_DEFAULT, 0},
     {0x0201, 0, 0, read_threshold, write_threshold, UDS_SESSION_EXTENDED, 1},
+    {0x0301, 0, 0, read_flash_digest, 0, UDS_SESSION_DEFAULT, 0},  /* 刷写摘要 */
 };
 
 static void print_bytes(const char *tag, const uint8_t *d, int n)
@@ -132,6 +237,7 @@ int main(int argc, char **argv)
     memset(&ucfg, 0, sizeof(ucfg));
     ucfg.dids = g_dids;
     ucfg.did_count = (uint16_t)(sizeof(g_dids) / sizeof(g_dids[0]));
+    ucfg.mem = &g_memif;
     uds_init(&srv, &ucfg);
 
     printf("[ecu] listening on %s, req=0x%03X rsp=0x%03X, %d s\n",
@@ -151,6 +257,40 @@ int main(int argc, char **argv)
             rlen = uds_handle_request(&srv, req, len, resp, sizeof(resp));
             if (rlen > 0)
             {
+                /*
+                 * 刷写进度跟踪。
+                 *
+                 * 库本身不关心 CRC —— 那是流程校验，属于应用层的事。
+                 * 但「写进去的字节对不对」总要有个办法证明，
+                 * 所以在示例里算一次，通过 DID 0x0301 暴露出去，
+                 * 让测试脚本用标准 0x22 读回来比对。
+                 */
+                if (req[0] == UDS_SID_REQUEST_DOWNLOAD && resp[0] == 0x74 && len >= 3)
+                {
+                    uint8_t alfid = req[2];
+                    uint8_t addr_len = (uint8_t)(alfid & 0x0F);
+                    uint8_t size_len = (uint8_t)((alfid >> 4) & 0x0F);
+                    uint32_t addr = 0, sz = 0;
+
+                    if ((uint16_t)(3 + addr_len + size_len) <= len)
+                    {
+                        for (uint8_t i = 0; i < addr_len; i++)
+                            addr = (addr << 8) | req[3 + i];
+                        for (uint8_t i = 0; i < size_len; i++)
+                            sz = (sz << 8) | req[3 + addr_len + i];
+
+                        g_flash_len = sz;
+                        g_flash_crc = 0;
+                        printf("[ecu] download: %u bytes -> 0x%08X\n", sz, addr);
+                    }
+                }
+                else if (req[0] == UDS_SID_TRANSFER_EXIT && resp[0] == 0x77)
+                {
+                    g_flash_crc = crc32_of(g_flash, g_flash_len);
+                    printf("[ecu] flash complete: %u bytes, crc32=0x%08X\n",
+                           g_flash_len, g_flash_crc);
+                }
+
                 print_bytes("[ecu] ->", resp, rlen);
                 isotp_send(&tp, &can, resp, (uint16_t)rlen);
 

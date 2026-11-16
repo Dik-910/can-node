@@ -29,14 +29,10 @@ output/
 .DS_Store
 Thumbs.db
 
-# 单测产物
-/test/can_matrix_test
-/test/can_driver_test
-/test/isotp_test
-/test/uds_test
-/test/boot_test
+# 单测产物。逐个列举必然漏（新加的 uds_transfer_test 就漏了），用通配
+/test/*_test
 /vcan-demo
 /ecu-server
 /bus-load
 /node
-/test/node_health_test
+/.ecu-flash.log

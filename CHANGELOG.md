@@ -35,6 +35,16 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
   表现为「对端恢复后仍然收不到数据」
 - `isotp_poll()` 保留为不检查超时的兼容版本，仅供单元测试精确控制时序使用
 
+**UDS 固件传输（0x34 / 0x36 / 0x37）**
+
+- `0x34` 请求下载：解析 addressAndLengthFormatIdentifier、校验地址与长度、
+  擦除目标区、回报单块最大长度（含 SID+BSC 两字节）
+- `0x36` 传输数据：块序号校验、重传识别、逐块写入存储器
+- `0x37` 请求退出传输
+- `uds_memory_t` 操作表注入：`write` / `read` / `erase` + 可写区范围。
+  为 NULL 时三个服务回 NRC 0x11，不假装支持
+- 越界检查先减后比，避免 `addr + size` 溢出后绕过检查
+
 ### Changed
 
 - `isotp_config_t` 新增 `n_bs_ms` / `n_cr_ms`，0 表示用默认值
@@ -58,7 +68,20 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
   FF→CF1→CF2，而不只是看状态字段）
 - 时间从 `0xFFFFFF00` 跨越回绕点仍正确判超时
 
-累计 246 项单元测试通过（matrix 17 / driver 36 / isotp 78 / uds 48 / boot 40 / health 27）。
+累计 297 项单元测试通过（matrix 17 / driver 36 / isotp 78 / uds 48 /
+uds_transfer 51 / boot 40 / health 27）。
+
+### 传输服务踩到的坑
+
+- **块序号 0xFF 之后是 0x00，不是 0x01**。写成「回绕到 1」会让第 256 块
+  被判成重传，数据永远少一块，而前 255 块全都"成功"
+- **重传必须和序号错误分开处理**。tester 丢了一个响应会用同一序号重发，
+  按 0x73 处理会让它中止整个刷写。重传时不能重复写——Flash 只能 1→0，
+  把刚写的字节再写一遍必然失败
+- **单块失败不能计入进度**。写失败却把 received 加上，后续字节会写到错误偏移，
+  最终 CRC 不对但每块都回了正响应
+- **越界检查先减后比**。`addr + size` 在 uint32 上溢出会变成很小的值，
+  反而通过检查
 
 ### 注意
 

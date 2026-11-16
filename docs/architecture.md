@@ -331,6 +331,103 @@ if (srv->st.session != UDS_SESSION_DEFAULT)
 
 ---
 
+### 3.6 固件传输：0x34 / 0x36 / 0x37
+
+这三个服务拼成一次刷写：
+
+```
+0x34  我要写 0x08000000 起 2048 字节   →  ECU 擦除，回「每包最多 256 字节」
+0x36  第 1 块（254 字节数据）           →  ECU 写入，回显序号 1
+0x36  第 2 块                           →  ...
+0x37  我发完了                          →  ECU 收尾
+```
+
+#### 三处容易写错的细节
+
+**1. maxNumberOfBlockLength 包含 SID 和 BSC**
+
+0x34 正响应里回的那个长度，是「一整包 0x36 请求」的长度，包含
+`SID(1) + BSC(1) + data`。如果按纯数据长度写（比如回 254 表示"你能发 254 字节数据"），
+tester 会发 254 字节数据 → 实际请求 256 字节 → 超出限制。表现是每块都被拒，
+或者更糟：最后一块刚好卡在边界上，看起来成功但少了两个字节。
+
+**2. 块序号 0xFF 之后是 0x00，不是 0x01**
+
+```c
+srv->xfer.bsc_next = (uint8_t)(bsc + 1);   /* 0xFF + 1 = 0x00 */
+```
+
+ISO 14229 规定第一块是 1，第 256 块是 **0**。写成「超过 0xFF 就回到 1」
+会让第 256 块被判成重传，数据永远少一块——2048 字节的固件刚好跨过一次回绕的话，
+最后校验不过，但前面 255 块全部"成功"。
+
+uint8 的自然回绕正好是这个语义，所以别加 `if` 去"修正"它。
+
+**3. 重传和序号错误必须区分**
+
+tester 没收到响应时，会**用同一个序号重发同一块**。这时如果按序号错误处理
+（回 NRC 0x73），tester 会中止整个刷写——只是丢了一个响应，却要重刷。
+
+正确做法：
+
+```c
+if (blocks > 0 && bsc == bsc_last) {
+    /* 重传：不重复写，只重发正响应 */
+    return send_positive(bsc);
+}
+if (bsc != bsc_next) {
+    return nrc(0x73);
+}
+```
+
+「不重复写」这条不能省。Flash 只能把 1 写成 0，把刚写过的字节再写一遍会失败，
+于是重传反而导致写入错误。
+
+#### 越界检查要先减后比
+
+```c
+/* 错：addr + total 可能溢出，溢出后是个很小的数，反而通过检查 */
+if (addr + total > base + capacity) reject();
+
+/* 对：先确认 addr 在区内，再用减法算剩余空间 */
+if (addr < base) reject();
+if (addr - base > capacity || total > capacity - (addr - base)) reject();
+```
+
+`addr = 0xFFFFFFF0, total = 0x20` 这种请求会溢出成很小的值。
+真实场景里这来自 tester 的 bug 或恶意构造，但后果是把固件写到任意位置。
+
+#### 存储器抽象
+
+传输服务只依赖三个函数：
+
+```c
+typedef struct {
+    int (*write)(void *ctx, uint32_t addr, const uint8_t *data, uint16_t len);
+    int (*read)(void *ctx, uint32_t addr, uint8_t *data, uint16_t len);
+    int (*erase)(void *ctx, uint32_t addr, uint32_t len);   /* 可空 */
+    void *ctx;
+    uint32_t base_addr;
+    uint32_t capacity;
+} uds_memory_t;
+```
+
+和 CAN 驱动一样是操作表注入：块序号、长度校验、越界检查都是纯逻辑，
+PC 上用内存模拟，硬件到了只实现这三个函数。
+
+`mem` 为 NULL 时三个服务返回 NRC 0x11 —— **不实现传输的节点不该假装支持**。
+
+#### 验证方式
+
+单测用带「1→0」约束的内存模拟（`test/uds_transfer_test.c`），
+能顺带验出「0x34 有没有真擦除」和「重传有没有重复写」。
+
+真实链路用 udsoncan 走完整刷写（`tools/flash_interop.py`），
+刷 2048 字节后读回 DID 0x0301 的 CRC32 与本地比对。
+**只验证"传输成功"没有意义**——写错位置、写漏一块，流程照样全绿。
+
+---
+
 ## 4. Bootloader
 
 ### 4.1 双区为什么必要

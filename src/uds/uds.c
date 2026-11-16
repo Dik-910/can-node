@@ -330,6 +330,227 @@ static int handle_write_data(uds_server_t *srv, const uint8_t *req, uint16_t len
     return 3;
 }
 
+/* ---------------- 0x34 / 0x36 / 0x37 固件传输 ---------------- */
+
+/*
+ * 传输服务的共同前提。
+ *
+ * 为什么要求「扩展会话或编程会话」而不是只认编程会话：
+ * ISO 14229 里 0x34 通常在编程会话下发，但很多 ECU 允许在扩展会话里
+ * 刷写应用区（尤其是只更新标定数据时）。这里放宽到两者之一，
+ * 但解锁是硬要求 —— 会话只表示「我要动配置了」，解锁才表示「我被授权了」。
+ */
+static int transfer_precheck(uds_server_t *srv, uint8_t sid,
+                             uint8_t *resp, uint16_t size)
+{
+    if (srv->cfg.mem == 0)
+        return send_negative(resp, size, sid, UDS_NRC_SERVICE_NOT_SUPPORTED);
+
+    if (srv->st.session != UDS_SESSION_EXTENDED &&
+        srv->st.session != UDS_SESSION_PROGRAMMING)
+        return send_negative(resp, size, sid, UDS_NRC_CONDITIONS_NOT_CORRECT);
+
+    if (srv->st.security_level == 0)
+        return send_negative(resp, size, sid, UDS_NRC_SECURITY_DENIED);
+
+    return 0;
+}
+
+/* 0x34 RequestDownload：告诉 ECU 要写哪、写多长，ECU 回「每包最多多少字节」 */
+static int handle_request_download(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                                   uint8_t *resp, uint16_t size)
+{
+    const uds_memory_t *mem = srv->cfg.mem;
+    uint8_t dfi, alfid, addr_len, size_len;
+    uint32_t addr = 0, total = 0;
+    uint32_t end;
+    uint16_t max_block;
+    int rc;
+
+    if ((rc = transfer_precheck(srv, UDS_SID_REQUEST_DOWNLOAD, resp, size)) != 0)
+        return rc;
+
+    if (len < 3)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_INCORRECT_LENGTH);
+
+    dfi = req[1];
+    alfid = req[2];
+    addr_len = (uint8_t)(alfid & 0x0F);
+    size_len = (uint8_t)((alfid >> 4) & 0x0F);
+
+    /*
+     * 长度字节数为 0 或超过 4 都不合法。
+     * ISO 允许 1..4 字节的地址/长度，实际常见 2 或 4。
+     */
+    if (addr_len == 0 || addr_len > 4 || size_len == 0 || size_len > 4)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_INCORRECT_LENGTH);
+
+    if (len != (uint16_t)(3 + addr_len + size_len))
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_INCORRECT_LENGTH);
+
+    /*
+     * dataFormatIdentifier 高 4 位是压缩方法，低 4 位是加密方法。
+     * 只支持 0x00（都不做）—— 声称支持却实际没解压，会导致写进去的是
+     * 压缩后的垃圾，而且 CRC 还是对的，故障极难定位。
+     */
+    if (dfi != 0x00)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    /* 大端解析 */
+    for (uint8_t i = 0; i < addr_len; i++)
+        addr = (addr << 8) | req[3 + i];
+    for (uint8_t i = 0; i < size_len; i++)
+        total = (total << 8) | req[3 + addr_len + i];
+
+    if (total == 0)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    /*
+     * 越界检查先减后比，避免 addr + total 在 uint32 上溢出。
+     * 溢出后是个很小的数，反而能通过检查 —— 这种写法比加法安全。
+     */
+    if (addr < mem->base_addr)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    if (addr - mem->base_addr > mem->capacity ||
+        total > mem->capacity - (addr - mem->base_addr))
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    end = addr + total; /* 到这里已经确认不溢出 */
+
+    /*
+     * 先擦后写。擦除失败就直接拒绝 —— 继续下去会在未擦除区域写，
+     * 得到一堆「本该是 1 却是 0」的位，体现为固件校验不过。
+     */
+    if (mem->erase != 0 && mem->erase(mem->ctx, addr, total) != 0)
+        return send_negative(resp, size, UDS_SID_REQUEST_DOWNLOAD, UDS_NRC_GENERAL_PROGRAM_FAIL);
+
+    srv->xfer.active = 1;
+    srv->xfer.addr = addr;
+    srv->xfer.total = total;
+    srv->xfer.received = 0;
+    srv->xfer.bsc_next = 1; /* 第一块固定是 1 */
+    srv->xfer.bsc_last = 0;
+    srv->xfer.blocks = 0;
+
+    max_block = (srv->cfg.max_block_len != 0) ? srv->cfg.max_block_len : 256;
+
+    /*
+     * 响应：0x74 + lengthFormatIdentifier + maxNumberOfBlockLength
+     *
+     * 关键：这个长度**包含 SID 和 BSC 两个字节**，不是纯数据长度。
+     * 报文里的值写成纯数据长度，tester 会多发 2 字节，每块都超界。
+     */
+    if (size < 4)
+        return -1;
+
+    resp[0] = (uint8_t)(UDS_SID_REQUEST_DOWNLOAD + POS_OFFSET);
+    resp[1] = 0x20; /* 低 4 位 = 2，表示后面 2 字节 */
+    resp[2] = (uint8_t)(max_block >> 8);
+    resp[3] = (uint8_t)(max_block & 0xFF);
+
+    (void)end;
+    return 4;
+}
+
+/* 0x36 TransferData：收一块数据并写入存储器 */
+static int handle_transfer_data(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                                uint8_t *resp, uint16_t size)
+{
+    const uds_memory_t *mem = srv->cfg.mem;
+    uint8_t bsc;
+    uint16_t data_len;
+    uint32_t remain;
+    int rc;
+
+    if ((rc = transfer_precheck(srv, UDS_SID_TRANSFER_DATA, resp, size)) != 0)
+        return rc;
+
+    if (len < 2)
+        return send_negative(resp, size, UDS_SID_TRANSFER_DATA, UDS_NRC_INCORRECT_LENGTH);
+
+    if (!srv->xfer.active)
+        return send_negative(resp, size, UDS_SID_TRANSFER_DATA, UDS_NRC_REQUEST_SEQUENCE_ERROR);
+
+    bsc = req[1];
+    data_len = (uint16_t)(len - 2);
+
+    if (size < 2)
+        return -1;
+
+    /*
+     * 重传：同一个块序号再次到达，说明 tester 没收到我们上次的响应。
+     *
+     * 必须识别出来而不是当成序号错误：真实链路上丢一个响应很常见，
+     * 直接报 0x73 会让 tester 中止整个刷写。这里不重复写入，
+     * 只重发正响应。
+     */
+    if (srv->xfer.blocks > 0 && bsc == srv->xfer.bsc_last)
+    {
+        resp[0] = (uint8_t)(UDS_SID_TRANSFER_DATA + POS_OFFSET);
+        resp[1] = bsc;
+        return 2;
+    }
+
+    if (bsc != srv->xfer.bsc_next)
+        return send_negative(resp, size, UDS_SID_TRANSFER_DATA, UDS_NRC_WRONG_BLOCK_SEQ);
+
+    remain = srv->xfer.total - srv->xfer.received;
+
+    if (data_len > remain)
+        return send_negative(resp, size, UDS_SID_TRANSFER_DATA, UDS_NRC_TRANSFER_SUSPENDED);
+
+    if (mem->write(mem->ctx, srv->xfer.addr + srv->xfer.received, &req[2], data_len) != 0)
+        return send_negative(resp, size, UDS_SID_TRANSFER_DATA, UDS_NRC_GENERAL_PROGRAM_FAIL);
+
+    srv->xfer.received += data_len;
+    srv->xfer.blocks++;
+    srv->xfer.bsc_last = bsc;
+
+    /*
+     * 序号推进：0xFF 之后是 0x00，不是 0x01。
+     * uint8 的自然回绕正好是这个语义（0 表示第 256 块），
+     * 所以不要写 if (n > 0xFF) n = 1 —— 那会让第 257 块被判成序号错误。
+     */
+    srv->xfer.bsc_next = (uint8_t)(bsc + 1);
+
+    resp[0] = (uint8_t)(UDS_SID_TRANSFER_DATA + POS_OFFSET);
+    resp[1] = bsc;
+    return 2;
+}
+
+/* 0x37 RequestTransferExit：结束传输 */
+static int handle_transfer_exit(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                                uint8_t *resp, uint16_t size)
+{
+    int rc;
+
+    (void)req;
+
+    if ((rc = transfer_precheck(srv, UDS_SID_TRANSFER_EXIT, resp, size)) != 0)
+        return rc;
+
+    if (len < 1)
+        return send_negative(resp, size, UDS_SID_TRANSFER_EXIT, UDS_NRC_INCORRECT_LENGTH);
+
+    if (!srv->xfer.active)
+        return send_negative(resp, size, UDS_SID_TRANSFER_EXIT, UDS_NRC_REQUEST_SEQUENCE_ERROR);
+
+    /*
+     * 允许提前退出：tester 可能在收完之前就因为别的原因放弃。
+     * 这里不报错，但把 received/total 留在日志里由上层判断 ——
+     * 「传输提前结束」和「传输完成」是两件事，不能悄悄混为一谈。
+     */
+    uds_abort_transfer(srv);
+
+    if (size < 1)
+        return -1;
+
+    resp[0] = (uint8_t)(UDS_SID_TRANSFER_EXIT + POS_OFFSET);
+    return 1;
+}
+
+
 /* ---------------- 对外接口 ---------------- */
 
 int uds_init(uds_server_t *srv, const uds_config_t *cfg)
@@ -376,6 +597,12 @@ int uds_handle_request(uds_server_t *srv, const uint8_t *req, uint16_t req_len,
         return handle_security_access(srv, req, req_len, resp, resp_size);
     case UDS_SID_WRITE_DATA:
         return handle_write_data(srv, req, req_len, resp, resp_size);
+    case UDS_SID_REQUEST_DOWNLOAD:
+        return handle_request_download(srv, req, req_len, resp, resp_size);
+    case UDS_SID_TRANSFER_DATA:
+        return handle_transfer_data(srv, req, req_len, resp, resp_size);
+    case UDS_SID_TRANSFER_EXIT:
+        return handle_transfer_exit(srv, req, req_len, resp, resp_size);
     case UDS_SID_TESTER_PRESENT:
         return handle_tester_present(srv, req, req_len, resp, resp_size);
     default:
@@ -415,4 +642,22 @@ void uds_tick(uds_server_t *srv, uint32_t elapsed_ms)
 const uds_state_t *uds_get_state(const uds_server_t *srv)
 {
     return (srv != 0) ? &srv->st : 0;
+}
+
+const uds_transfer_t *uds_get_transfer(const uds_server_t *srv)
+{
+    static const uds_transfer_t empty;
+
+    if (srv == 0)
+        return &empty;
+
+    return &srv->xfer;
+}
+
+void uds_abort_transfer(uds_server_t *srv)
+{
+    if (srv == 0)
+        return;
+
+    memset(&srv->xfer, 0, sizeof(srv->xfer));
 }

@@ -47,3 +47,24 @@ jobs:
           make ecu-server
           make vcan-demo
           make bus-load
+
+      # 固件传输服务：用 udsoncan 走完整刷写，再用 CRC32 验证写进去的字节
+      - name: Flash interop over vcan
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq can-utils
+          python3 -m pip install --quiet python-can can-isotp udsoncan
+
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+
+          make flash-interop | tee /tmp/flash.log
+
+          # 必须真跑，而不是半路失败被吞掉
+          grep -qE "Result: [0-9]+ passed, 0 failed" /tmp/flash.log
+          # 核心断言：写进存储器的字节与本地一致
+          grep -q "CRC32 of written bytes matches" /tmp/flash.log
+          # 块大小协商：服务端必须回报可用的块长度
+          grep -q "server reported a block length" /tmp/flash.log
+          echo "flash interop verified"
