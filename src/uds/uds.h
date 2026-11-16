@@ -29,6 +29,7 @@
 #define UDS_SID_READ_DATA       0x22
 #define UDS_SID_SECURITY_ACCESS 0x27
 #define UDS_SID_WRITE_DATA      0x2E
+#define UDS_SID_ROUTINE_CONTROL 0x31
 #define UDS_SID_REQUEST_DOWNLOAD 0x34
 #define UDS_SID_TRANSFER_DATA   0x36
 #define UDS_SID_TRANSFER_EXIT   0x37
@@ -126,6 +127,47 @@ typedef struct
     uint32_t capacity;  /* 可写区长度，用来做越界检查 */
 } uds_memory_t;
 
+/*
+ * 例程控制（0x31）的子功能
+ */
+#define UDS_ROUTINE_START   0x01
+#define UDS_ROUTINE_STOP    0x02
+#define UDS_ROUTINE_RESULT  0x03
+
+/*
+ * 内置例程。不需要注册，配了 uds_memory_t 就能用。
+ *
+ * 这两个是刷写标配：擦除、刷完之后算 CRC 自证。
+ * 让每个项目都自己写一遍没有意义，逻辑是固定的。
+ */
+#define UDS_RID_ERASE_MEMORY  0xFF00u /* 参数：addr(4) + size(4)，擦除该区间 */
+#define UDS_RID_CHECK_MEMORY  0x0202u /* 参数：addr(4) + size(4)，requestResults 返回 CRC32 */
+
+/*
+ * 自定义例程。
+ *
+ * 内置的两个之外，项目常需要：硬件自检、传感器标定复位、进/出产线模式……
+ * 这些没法预置，所以留一张表。
+ *
+ * 参数（routineControlOptionRecord）的格式由例程自己定义 ——
+ * 协议层只管把字节透传过去，不猜语义。
+ */
+typedef struct
+{
+    uint16_t rid;
+
+    /* start/stop 失败返回负值，UDS 层转成 NRC 0x72 */
+    int (*start)(void *ctx, const uint8_t *opt, uint16_t opt_len);
+    int (*stop)(void *ctx);
+
+    /* requestResults：把结果写进 out，长度写进 out_len。可空 */
+    int (*result)(void *ctx, uint8_t *out, uint16_t *out_len);
+
+    uint8_t min_session; /* 最低会话 */
+    uint8_t need_unlock; /* 是否必须解锁 */
+    void *ctx;
+} uds_routine_entry_t;
+
 /* 一次传输的进度 */
 typedef struct
 {
@@ -161,6 +203,13 @@ typedef struct
      * 所以不要超过 510 左右，否则 0x36 请求本身会被传输层拒掉。
      */
     uint16_t max_block_len;
+
+    /*
+     * 自定义例程表。内置的 0xFF00 / 0x0202 不需要放进来 ——
+     * 只要 cfg.mem 不为空，它们自动可用。
+     */
+    const uds_routine_entry_t *routines;
+    uint16_t routine_count;
 } uds_config_t;
 
 typedef struct
@@ -170,6 +219,20 @@ typedef struct
     uint32_t seed_state; /* 默认种子生成器的内部状态 */
     uint32_t seed;       /* 最近一次下发的种子，用来校验密钥 */
     uds_transfer_t xfer; /* 0x34/0x36/0x37 的进度 */
+
+    /*
+     * checkMemory 的结果缓存。
+     *
+     * 为什么要缓存：0x31 的 start 和 requestResults 是两次独立请求，
+     * 中间隔着 tester 的处理时间。真去读 64KB Flash 算 CRC 再返回，
+     * 一次请求内做不完（P2 只有 50ms），所以 start 时算好、result 时取。
+     * 这也是 ISO 14229 建议的用法。
+     */
+    uint32_t routine_crc;
+    uint32_t routine_addr;
+    uint32_t routine_size;
+    uint8_t routine_crc_valid;
+
     int initialized;
 } uds_server_t;
 
@@ -196,5 +259,16 @@ const uds_transfer_t *uds_get_transfer(const uds_server_t *srv);
 
 /* 主动中止传输（例如上位机断开、或收到 0x11 复位前）。可重复调用 */
 void uds_abort_transfer(uds_server_t *srv);
+
+/* 查询最近一次 checkMemory 的结果。valid 为 0 表示还没算过 */
+typedef struct
+{
+    uint32_t addr;
+    uint32_t size;
+    uint32_t crc;
+    uint8_t valid;
+} uds_routine_result_t;
+
+const uds_routine_result_t *uds_get_routine_result(const uds_server_t *srv);
 
 #endif

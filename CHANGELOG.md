@@ -45,6 +45,16 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
   为 NULL 时三个服务回 NRC 0x11，不假装支持
 - 越界检查先减后比，避免 `addr + size` 溢出后绕过检查
 
+**UDS 例程控制（0x31）**
+
+- 内置两个例程，配了 `uds_memory_t` 就自动可用：
+  - `0xFF00` eraseMemory：参数 addr(4) + size(4)，擦除该区间
+  - `0x0202` checkMemory：start 时算 CRC32，requestResults 返回
+- `uds_routine_entry_t` 自定义例程表（start/stop/result 三个回调），
+  参数语义由例程自己定义，协议层只透传
+- 内置例程的 CRC 与 `src/boot/boot.c` 的 `boot_crc32` 同一算法，
+  保证「诊断校验」和「Bootloader 跳转前校验」算的是同一个值
+
 ### Changed
 
 - `isotp_config_t` 新增 `n_bs_ms` / `n_cr_ms`，0 表示用默认值
@@ -68,11 +78,12 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
   FF→CF1→CF2，而不只是看状态字段）
 - 时间从 `0xFFFFFF00` 跨越回绕点仍正确判超时
 
-累计 303 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
-uds_transfer 51 / boot 40 / health 27）。
+累计 337 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
+uds_transfer 51 / uds_routine 34 / boot 40 / health 27）。
 
 真实链路：`make flash-interop` 用 udsoncan 刷 2048 字节（9 块），
-读回 DID 0x0301 的 CRC32 与本地一致 —— 10 项断言全过。
+再用 `0x31` 让 ECU 自己算 CRC（`0x50DFCC83`），与本地 zlib 一致，
+并交叉验证 `0x31` / `0x22` 两条路径报告同一个值 —— 14 项断言全过。
 
 ### 固件传输暴露的三个问题（单测发现不了）
 
@@ -109,6 +120,16 @@ tester 的 P2 只有 50ms，调度一抖就超时。改成一次把可读的帧�
 
 改成 `block_size=0, stmin=0`。真实项目要按总线负载留余量（1~2ms 常见），
 联调取 0 是为了速度；接收侧靠「一次收干净」跟上。
+
+### 例程控制的一个设计点
+
+**CRC 必须缓存，不能等 requestResults 时现算。**
+
+算 64KB 要读 1024 次存储器，一次请求内做不完（P2 只有 50ms）。
+start 时算好存起来，result 时直接取 —— 这是 ISO 14229 建议的用法。
+
+如果现算，小固件（几百字节）测起来完全正常，稍大一点就超时。
+和前面几个问题一样：只有真跑才暴露。
 
 ### 传输服务的四个实现细节
 

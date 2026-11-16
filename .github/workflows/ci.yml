@@ -63,8 +63,10 @@ jobs:
 
           # 必须真跑，而不是半路失败被吞掉
           grep -qE "Result: [0-9]+ passed, 0 failed" /tmp/flash.log
-          # 核心断言：写进存储器的字节与本地一致
-          grep -q "CRC32 of written bytes matches" /tmp/flash.log
+          # 核心断言：ECU 自己算的 CRC 与本地一致（走 0x31）
+          grep -q "CRC32 computed by the ECU matches" /tmp/flash.log
+          # 0x31 与 0x22 两条路径必须报告同一个值
+          grep -q "0x31 and 0x22 report the same CRC" /tmp/flash.log
           # 块大小协商：服务端必须回报可用的块长度
           grep -q "server reported a block length" /tmp/flash.log
           echo "flash interop verified"

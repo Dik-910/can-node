@@ -519,6 +519,275 @@ static int handle_transfer_data(uds_server_t *srv, const uint8_t *req, uint16_t 
     return 2;
 }
 
+
+/* ---------------- 0x31 例程控制 ---------------- */
+
+/*
+ * CRC32，反射算法（多项式 0xEDB88320），与 src/boot/boot.c 一致。
+ * 校验固件完整性和 Bootloader 跳转前算的是同一个值，不能各写一套。
+ */
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
+{
+    crc = ~crc;
+
+    for (uint32_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+
+    return ~crc;
+}
+
+/*
+ * 内置例程的参数格式：addr(4 字节大端) + size(4 字节大端)。
+ *
+ * 为什么要求参数里带地址，而不是复用上一次 0x34 的范围：
+ * 校验和擦除可能作用于不同的区（比如只校验应用区、擦除整个备份区），
+ * 复用 0x34 的范围会把两件事绑死。显式传更好排障。
+ */
+static int parse_addr_size(const uds_memory_t *mem, const uint8_t *opt, uint16_t opt_len,
+                           uint32_t *addr, uint32_t *size)
+{
+    uint32_t a = 0, n = 0;
+
+    if (opt_len != 8)
+        return -1;
+
+    for (int i = 0; i < 4; i++)
+        a = (a << 8) | opt[i];
+    for (int i = 0; i < 4; i++)
+        n = (n << 8) | opt[4 + i];
+
+    if (n == 0)
+        return -1;
+
+    /* 与 0x34 相同的越界判断：先确认起点，再用减法算剩余空间，避免相加溢出 */
+    if (a < mem->base_addr)
+        return -1;
+
+    if (a - mem->base_addr > mem->capacity ||
+        n > mem->capacity - (a - mem->base_addr))
+        return -1;
+
+    *addr = a;
+    *size = n;
+    return 0;
+}
+
+/* 算一段存储区的 CRC32。分块读，避免在栈上开一个大缓冲 */
+static int compute_crc(const uds_memory_t *mem, uint32_t addr, uint32_t size,
+                       uint32_t *out_crc)
+{
+    uint8_t buf[64];
+    uint32_t crc = 0;
+    uint32_t off = 0;
+
+    while (off < size)
+    {
+        uint32_t n = size - off;
+
+        if (n > sizeof(buf))
+            n = sizeof(buf);
+
+        if (mem->read(mem->ctx, addr + off, buf, (uint16_t)n) != 0)
+            return -1;
+
+        /*
+         * crc32_update 内部做反码进出，所以第一次必须从 0 开始传入，
+         * 后续把上一次的结果接上即可 —— 不能自己再补 0xFFFFFFFF，
+         * 那会把中间结果算坏（表现为 CRC 只在单块数据时正确）。
+         */
+        crc = crc32_update(crc, buf, n);
+        off += n;
+    }
+
+    *out_crc = crc;
+    return 0;
+}
+
+/* 在自定义表里找，内置的不在这张表里 */
+static const uds_routine_entry_t *find_routine(const uds_server_t *srv, uint16_t rid)
+{
+    for (uint16_t i = 0; i < srv->cfg.routine_count; i++)
+    {
+        if (srv->cfg.routines[i].rid == rid)
+            return &srv->cfg.routines[i];
+    }
+
+    return 0;
+}
+
+/* 0x31 RoutineControl */
+static int handle_routine_control(uds_server_t *srv, const uint8_t *req, uint16_t len,
+                                  uint8_t *resp, uint16_t size)
+{
+    const uds_memory_t *mem = srv->cfg.mem;
+    const uds_routine_entry_t *re;
+    uint8_t sub;
+    uint16_t rid;
+    uint8_t builtin;
+
+    if (len < 4)
+        return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL, UDS_NRC_INCORRECT_LENGTH);
+
+    sub = req[1];
+    rid = (uint16_t)(((uint16_t)req[2] << 8) | req[3]);
+
+    if (sub != UDS_ROUTINE_START && sub != UDS_ROUTINE_STOP && sub != UDS_ROUTINE_RESULT)
+        return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL, UDS_NRC_SUB_FUNCTION_INVALID);
+
+    /*
+     * 内置例程优先。放在自定义表之前查，是为了让「配了 mem 就有擦除和校验」
+     * 这件事无条件成立 —— 用户表里误写了同一个 rid 也不该把内置的顶掉。
+     */
+    builtin = (mem != 0 && (rid == UDS_RID_ERASE_MEMORY || rid == UDS_RID_CHECK_MEMORY)) ? 1 : 0;
+    re = find_routine(srv, rid);
+
+    if (!builtin && re == 0)
+        return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    /* 权限：内置例程一律要求扩展或编程会话 + 解锁 */
+    if (builtin)
+    {
+        if (srv->st.session != UDS_SESSION_EXTENDED &&
+            srv->st.session != UDS_SESSION_PROGRAMMING)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_CONDITIONS_NOT_CORRECT);
+
+        if (srv->st.security_level == 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL, UDS_NRC_SECURITY_DENIED);
+    }
+    else
+    {
+        if (!session_allows(srv, re->min_session))
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_CONDITIONS_NOT_CORRECT);
+
+        if (re->need_unlock && srv->st.security_level == 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL, UDS_NRC_SECURITY_DENIED);
+    }
+
+    if (size < 4)
+        return -1;
+
+    /* 正响应先填好头，具体内容由各分支补 */
+    resp[0] = (uint8_t)(UDS_SID_ROUTINE_CONTROL + POS_OFFSET);
+    resp[1] = sub;
+    resp[2] = (uint8_t)(rid >> 8);
+    resp[3] = (uint8_t)rid;
+
+    if (builtin && rid == UDS_RID_ERASE_MEMORY)
+    {
+        uint32_t addr, n;
+
+        if (sub != UDS_ROUTINE_START)
+            return 4; /* 擦除没有中间状态，stop/result 回空状态即可 */
+
+        if (parse_addr_size(mem, &req[4], (uint16_t)(len - 4), &addr, &n) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+        if (mem->erase == 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+
+        if (mem->erase(mem->ctx, addr, n) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+
+        return 4;
+    }
+
+    if (builtin && rid == UDS_RID_CHECK_MEMORY)
+    {
+        uint32_t addr, n;
+
+        if (sub == UDS_ROUTINE_RESULT)
+        {
+            /*
+             * 结果在 start 时就算好了。这里只取缓存 ——
+             * 现算的话 64KB 要几十毫秒，顶着 P2 超时。
+             */
+            if (!srv->routine_crc_valid)
+                return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                     UDS_NRC_REQUEST_SEQUENCE_ERROR);
+
+            if (size < 8)
+                return -1;
+
+            resp[4] = (uint8_t)(srv->routine_crc >> 24);
+            resp[5] = (uint8_t)(srv->routine_crc >> 16);
+            resp[6] = (uint8_t)(srv->routine_crc >> 8);
+            resp[7] = (uint8_t)srv->routine_crc;
+            return 8;
+        }
+
+        if (sub == UDS_ROUTINE_STOP)
+            return 4;
+
+        /* start：先算，结果留给 requestResults */
+        if (parse_addr_size(mem, &req[4], (uint16_t)(len - 4), &addr, &n) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+        if (mem->read == 0 ||
+            compute_crc(mem, addr, n, &srv->routine_crc) != 0)
+        {
+            srv->routine_crc_valid = 0;
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+        }
+
+        srv->routine_addr = addr;
+        srv->routine_size = n;
+        srv->routine_crc_valid = 1;
+        return 4;
+    }
+
+    /* 自定义例程 */
+    if (sub == UDS_ROUTINE_START)
+    {
+        if (re->start == 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_SUB_FUNCTION_INVALID);
+        if (re->start(re->ctx, &req[4], (uint16_t)(len - 4)) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+        return 4;
+    }
+
+    if (sub == UDS_ROUTINE_STOP)
+    {
+        if (re->stop == 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_SUB_FUNCTION_INVALID);
+        if (re->stop(re->ctx) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+        return 4;
+    }
+
+    /* UDS_ROUTINE_RESULT */
+    if (re->result == 0)
+        return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                             UDS_NRC_SUB_FUNCTION_INVALID);
+
+    {
+        uint16_t out_len = 0;
+
+        if (re->result(re->ctx, &resp[4], &out_len) != 0)
+            return send_negative(resp, size, UDS_SID_ROUTINE_CONTROL,
+                                 UDS_NRC_GENERAL_PROGRAM_FAIL);
+
+        if ((uint16_t)(4 + out_len) > size)
+            return -1;
+
+        return (int)(4 + out_len);
+    }
+}
+
 /* 0x37 RequestTransferExit：结束传输 */
 static int handle_transfer_exit(uds_server_t *srv, const uint8_t *req, uint16_t len,
                                 uint8_t *resp, uint16_t size)
@@ -603,6 +872,8 @@ int uds_handle_request(uds_server_t *srv, const uint8_t *req, uint16_t req_len,
         return handle_transfer_data(srv, req, req_len, resp, resp_size);
     case UDS_SID_TRANSFER_EXIT:
         return handle_transfer_exit(srv, req, req_len, resp, resp_size);
+    case UDS_SID_ROUTINE_CONTROL:
+        return handle_routine_control(srv, req, req_len, resp, resp_size);
     case UDS_SID_TESTER_PRESENT:
         return handle_tester_present(srv, req, req_len, resp, resp_size);
     default:
@@ -660,4 +931,21 @@ void uds_abort_transfer(uds_server_t *srv)
         return;
 
     memset(&srv->xfer, 0, sizeof(srv->xfer));
+}
+
+const uds_routine_result_t *uds_get_routine_result(const uds_server_t *srv)
+{
+    static uds_routine_result_t r;
+
+    if (srv == 0)
+    {
+        r.valid = 0;
+        return &r;
+    }
+
+    r.addr = srv->routine_addr;
+    r.size = srv->routine_size;
+    r.crc = srv->routine_crc;
+    r.valid = srv->routine_crc_valid;
+    return &r;
 }

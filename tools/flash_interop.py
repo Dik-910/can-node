@@ -40,6 +40,7 @@ import can
 import isotp
 import udsoncan
 from udsoncan import DataFormatIdentifier, MemoryLocation
+from udsoncan.services import RoutineControl
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
 
@@ -158,24 +159,55 @@ def main():
         r = client.request_transfer_exit()
         check(r.positive, "0x37 accepted")
 
-        # ---------- 校验：读摘要 ----------
-        print("\nVerify written content (0x22 DID 0x0301)")
+        # ---------- 校验 1：0x31 让 ECU 自己算 ----------
+        #
+        # 这是真实刷写流程里的做法：tester 不读回全部数据去比对
+        # （那样要占用大量带宽），而是发 0x31 让 ECU 自己算 CRC 回报。
+        print("\nVerify via 0x31 checkMemory")
+        opt = (FLASH_BASE.to_bytes(4, "big") + TOTAL_BYTES.to_bytes(4, "big"))
+
+        r = client.routine_control(routine_id=0x0202,
+                                   control_type=RoutineControl.ControlType.startRoutine,
+                                   data=opt)
+        check(r.positive, "0x31 start accepted")
+        check(r.service_data.routine_id_echo == 0x0202, "routine id echoed")
+
+        r = client.routine_control(routine_id=0x0202,
+                                   control_type=RoutineControl.ControlType.requestRoutineResults)
+        check(r.positive, "0x31 requestResults accepted")
+
+        crc_from_ecu = None
+
+        if r.positive:
+            rec = r.service_data.routine_status_record
+            check(rec is not None and len(rec) >= 4, "status record carries the CRC",
+                  f"{len(rec) if rec else 0} bytes")
+
+            if rec and len(rec) >= 4:
+                crc_from_ecu = int.from_bytes(rec[0:4], "big")
+                check(crc_from_ecu == expect_crc,
+                      "CRC32 computed by the ECU matches",
+                      f"got 0x{crc_from_ecu:08X}, expect 0x{expect_crc:08X}")
+
+        # ---------- 校验 2：读 DID 交叉验证 ----------
+        #
+        # 两条路径（0x31 与 0x22）走的是不同代码，结果一致才说明
+        # 「算 CRC」这件事没有在某一处被写歪。
+        print("\nCross-check with 0x22 DID 0x0301")
         r = client.read_data_by_identifier([0x0301])
         check(r.positive, "digest DID readable")
 
         if r.positive:
             raw = did_bytes(r, 0x0301)
-            check(len(raw) == 8, "digest is 8 bytes", f"{len(raw)}")
-
             if len(raw) == 8:
-                got_crc = int.from_bytes(raw[0:4], "big")
-                got_len = int.from_bytes(raw[4:8], "big")
+                did_crc = int.from_bytes(raw[0:4], "big")
+                did_len = int.from_bytes(raw[4:8], "big")
 
-                check(got_len == TOTAL_BYTES, "server recorded the right length",
-                      f"{got_len}")
-                check(got_crc == expect_crc,
-                      "CRC32 of written bytes matches",
-                      f"got 0x{got_crc:08X}, expect 0x{expect_crc:08X}")
+                check(did_len == TOTAL_BYTES, "server recorded the right length",
+                      f"{did_len}")
+                check(crc_from_ecu is None or did_crc == crc_from_ecu,
+                      "0x31 and 0x22 report the same CRC",
+                      f"0x{did_crc:08X}")
 
     bus.shutdown()
 

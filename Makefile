@@ -12,12 +12,13 @@ dbc:
 	python3 -m cantools generate_c_source docs/can_matrix.dbc -o $(GEN)
 
 # PC 侧单元测试，不依赖硬件与 CAN 环境
-test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/uds_transfer_test test/boot_test test/node_health_test
+test: test/can_matrix_test test/can_driver_test test/isotp_test test/uds_test test/uds_transfer_test test/uds_routine_test test/boot_test test/node_health_test
 	./test/can_matrix_test
 	./test/can_driver_test
 	./test/isotp_test
 	./test/uds_test
 	./test/uds_transfer_test
+	./test/uds_routine_test
 	./test/boot_test
 	./test/node_health_test
 
@@ -37,6 +38,9 @@ test/uds_test: test/uds_test.c src/uds/uds.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 test/uds_transfer_test: test/uds_transfer_test.c src/uds/uds.c
+	$(CC) $(CFLAGS) $^ -o $@
+
+test/uds_routine_test: test/uds_routine_test.c src/uds/uds.c
 	$(CC) $(CFLAGS) $^ -o $@
 
 test/boot_test: test/boot_test.c src/boot/boot.c src/boot/boot_flash_ram.c
