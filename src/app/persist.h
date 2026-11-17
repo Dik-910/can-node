@@ -71,6 +71,11 @@ typedef struct
  * nvm_file_dev 填充，一执行就跳 NULL。抽到这里以后有单测盯着。
  *
  * reset 非 0 时先把整个参数区擦除，等价于一块新板子。
+ *
+ * 成功返回时**已经推进了一个操作循环**（dtc_operation_cycle）——
+ * 本次上电就是一个新循环，且是在恢复之后推进的，cycle 接着上次的数。
+ * 调用方不要再自己调一次。
+ *
  * 返回 0 成功，负值表示设备不可用 —— 调用方应当降级运行而不是退出。
  */
 int persist_boot(persist_t *p, nvm_store_t *nvm, const nvm_dev_t *dev,

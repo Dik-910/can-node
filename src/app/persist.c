@@ -180,7 +180,20 @@ int persist_boot(persist_t *p, nvm_store_t *nvm, const nvm_dev_t *dev,
     if (nvm_store_mount(nvm, dev) != 0)
         return -1;
 
-    return persist_mount(p, nvm, dtcs, def, now_ms);
+    if (persist_mount(p, nvm, dtcs, def, now_ms) != 0)
+        return -1;
+
+    /*
+     * 恢复完成，本次上电才算一个新的操作循环。
+     *
+     * 这一步必须在这里做，不能留给调用方：
+     * import 会把 cycle 覆盖成存储里的值，谁要是先推进再恢复，
+     * 刚加的那一次就被抹掉了 —— 表现为「重启后循环号永远是 1」。
+     * 两者顺序是耦合的，分散到调用方就一定会写反（已经反过一次）。
+     */
+    dtc_operation_cycle(dtcs);
+
+    return 0;
 }
 
 int persist_mount(persist_t *p, nvm_store_t *nvm, dtc_store_t *dtcs,

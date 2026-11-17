@@ -308,7 +308,7 @@ int main(int argc, char **argv)
         dcfg.def_count = (uint16_t)(sizeof(g_dtc_defs) / sizeof(g_dtc_defs[0]));
         dtc_init(&g_dtcs, &dcfg);
         dtc_set_snapshot_provider(&g_dtcs, snap_provider);
-        dtc_operation_cycle(&g_dtcs); /* 上电进入第 1 个操作循环 */
+        /* 操作循环在持久化恢复之后再推进，见下面 persist_boot 之后 */
     }
     ucfg.dtcs = &g_dtcs;
 
@@ -347,6 +347,7 @@ int main(int argc, char **argv)
                    g_nvm.valid ? "restored" : "blank", g_threshold,
                    (unsigned)g_dtcs.count, (unsigned)g_dtcs.cycle);
         }
+
     }
 
     memset(&node, 0, sizeof(node));

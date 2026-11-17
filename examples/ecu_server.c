@@ -387,8 +387,14 @@ int main(int argc, char **argv)
         dcfg.def_count = (uint16_t)(sizeof(g_dtc_defs) / sizeof(g_dtc_defs[0]));
         dtc_init(&g_dtcs, &dcfg);
         dtc_set_snapshot_provider(&g_dtcs, snap_provider);
-        /* 上电即进入第 1 个操作循环，老化计数从这里开始数 */
-        dtc_operation_cycle(&g_dtcs);
+
+        /*
+         * 这里**不能**推进操作循环。
+         *
+         * 推进要在持久化恢复之后做：import 会把 cycle 换成上次存下的值，
+         * 先推进再恢复，刚加的这一就白加了（永远停在 1）。
+         * persist_boot 会在恢复完成之后推进，见那里的注释。
+         */
     }
 
     ucfg.dtcs = &g_dtcs;

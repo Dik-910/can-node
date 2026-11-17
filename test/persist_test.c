@@ -77,11 +77,9 @@ static void power_on(board_t *b, uint32_t now_ms)
      */
     memset(&b->nvm, 0, sizeof(b->nvm));
     memset(&b->persist, 0, sizeof(b->persist));
+    /* persist_boot 内部会在恢复之后推进操作循环，这里不要再调一次 */
     persist_boot(&b->persist, &b->nvm, mem_nvm_dev(&b->mem), 0,
                  &b->dtcs, &DEF_PARAMS, now_ms);
-
-    /* 上电即一个新循环，与真实节点的启动顺序一致 */
-    dtc_operation_cycle(&b->dtcs);
 }
 
 /* ---- 首次上电 ---- */
@@ -345,6 +343,40 @@ static void test_bad_version(void)
           "版本不认识则回默认", b.persist.params.threshold, DEF_PARAMS.threshold);
 }
 
+/* ---- 循环号必须跨复位递增 ---- */
+
+/*
+ * 这一条盯的是「恢复与推进的先后顺序」。
+ *
+ * 如果实现里先 dtc_operation_cycle 再 import（或者调用方自己又推一次），
+ * import 会用存储里的旧值覆盖刚加的那一次，cycle 永远停在 1 ——
+ * 而「读码能读到」之类的断言全都仍然通过。CI 里就是这么漏过去的。
+ */
+static void test_cycle_advances(void)
+{
+    board_t b;
+    uint32_t c1, c2, c3;
+
+    printf("操作循环号跨复位递增\n");
+
+    mem_nvm_init(&b.mem, AREA_SIZE);
+    power_on(&b, 0);
+    c1 = b.dtcs.cycle;
+    check(c1 == 1, "首次上电 cycle=1", (long)c1, 1);
+
+    /* 必须落盘，否则下次读到的是空的，测的就不是「跨复位」了 */
+    persist_save_now(&b.persist, 0);
+
+    power_on(&b, 100);
+    c2 = b.dtcs.cycle;
+    check(c2 == c1 + 1, "重启后 cycle 递增", (long)c2, (long)(c1 + 1));
+    persist_save_now(&b.persist, 100);
+
+    power_on(&b, 200);
+    c3 = b.dtcs.cycle;
+    check(c3 == c2 + 1, "再次重启仍递增", (long)c3, (long)(c2 + 1));
+}
+
 /* ---- 引导序列本身 ---- */
 
 static void test_boot_reset(void)
@@ -434,6 +466,7 @@ int main(void)
     test_write_rate();
     test_corrupt_data_uses_defaults();
     test_bad_version();
+    test_cycle_advances();
     test_boot_reset();
     test_boot_rejects_bad_device();
 

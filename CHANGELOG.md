@@ -105,9 +105,9 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
 同一循环内重复失败只计一次、发生次数按沿计、快照只抓一次、静默循环不推进老化。
 `test/uds_dtc_test`（46 项）逐字节校验 `0x19` 五个子功能的响应格式与 `0x14` 的会话门槛。
 
-累计 516 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
+累计 519 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
 uds_transfer 51 / uds_routine 34 / dtc 54 / uds_dtc 46 / boot 40 / health 27 /
-nvm_store 35 / persist 29 / nvm_file 15）。
+nvm_store 35 / persist 32 / nvm_file 15）。
 
 真实链路：`make flash-interop` 用 udsoncan 刷 2048 字节（9 块），
 再用 `0x31` 让 ECU 自己算 CRC（`0x50DFCC83`），与本地 zlib 一致，
