@@ -55,11 +55,21 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
 - 内置例程的 CRC 与 `src/boot/boot.c` 的 `boot_crc32` 同一算法，
   保证「诊断校验」和「Bootloader 跳转前校验」算的是同一个值
 
+**UDS 故障码（0x19 / 0x14）**
+
+- `dtc.c` 故障存储器：pending / confirmed 两档判定、按操作循环确认、
+  按沿计发生次数、老化清除
+- `0x19` 五个子功能：`01` 按掩码报数量、`02` 按掩码报列表、`04` 读快照、
+  `06` 读扩展数据、`0A` 报支持的码
+- `0x14` 清故障码，要求扩展会话
+- 快照采集以回调注入，首次失败时抓取一次；存储层不限定快照内容
+- `uds_config_t.dtcs` 为 NULL 时两个服务回 NRC 0x11
+
 ### Changed
 
 - `isotp_config_t` 新增 `n_bs_ms` / `n_cr_ms`，0 表示用默认值
 
-### 实现细节（都是踩过的坑）
+### 实现约束
 
 - **计时器起算不能靠「时间戳是否为 0」判断**：调用方的时间可能就从 0 开始
   （PC 测试、刚上电的 SysTick），拿 0 当哨兵会让计时器永远起不来。改用
@@ -71,23 +81,27 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
 
 ### 测试
 
-`test/isotp_test` 从 54 项增至 78 项，新增：
+`test/isotp_test` 从 54 项增至 84 项，新增：
 
 - N_Bs 超时（对端不发流控）、N_Cr 超时（对端不发连续帧）
 - **超时后能立刻发起新传输**，以及**完整跑完一轮多帧**（断言总线上的真实帧序列
   FF→CF1→CF2，而不只是看状态字段）
 - 时间从 `0xFFFFFF00` 跨越回绕点仍正确判超时
 
-累计 337 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
-uds_transfer 51 / uds_routine 34 / boot 40 / health 27）。
+`test/dtc_test`（54 项）覆盖故障生命周期：pending 与 confirmed 的两循环判定、
+同一循环内重复失败只计一次、发生次数按沿计、快照只抓一次、静默循环不推进老化。
+`test/uds_dtc_test`（46 项）逐字节校验 `0x19` 五个子功能的响应格式与 `0x14` 的会话门槛。
+
+累计 437 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
+uds_transfer 51 / uds_routine 34 / dtc 54 / uds_dtc 46 / boot 40 / health 27）。
 
 真实链路：`make flash-interop` 用 udsoncan 刷 2048 字节（9 块），
 再用 `0x31` 让 ECU 自己算 CRC（`0x50DFCC83`），与本地 zlib 一致，
 并交叉验证 `0x31` / `0x22` 两条路径报告同一个值 —— 14 项断言全过。
 
-### 固件传输暴露的三个问题（单测发现不了）
+### 固件传输暴露的三个问题（仅真实刷写可复现）
 
-这三个都是跑真实刷写时才出来的，几十字节的普通 UDS 请求完全触发不到：
+以下三个问题只在完整刷写流程中出现，数十字节的常规 UDS 请求无法触发：
 
 **1. `isotp_recv` 没有容量检查，直接 memcpy**
 
