@@ -173,4 +173,44 @@ int dtc_get_info(const dtc_store_t *st, uint32_t code, dtc_info_t *out);
 /* 故障名称，查不到返回 "UNKNOWN" */
 const char *dtc_name(const dtc_store_t *st, uint32_t code);
 
+/* ---------------- 跨复位保持 ---------------- */
+
+/*
+ * 故障存储要跨复位保留，否则「连续 40 个操作循环无故障才老化清除」
+ * 这件事在上电周期之间根本接不上 —— 每条故障的 aging_cycles 都从 0 重新数，
+ * 永远到不了 40。
+ *
+ * 所以序列化的内容不只是条目，还有**操作循环号 cycle** 本身：
+ * 它是老化计数的分母，丢了等于把老化进度清零。
+ *
+ * 本层仍然不碰 IO：只负责「打包成字节 / 从字节恢复」，
+ * 存到哪里由 nvm 层决定。
+ */
+
+/* 布局版本。字段有任何增减都要递增，旧数据会被 import 拒绝 */
+#define DTC_BLOB_VERSION 1u
+
+/* 单条记录的线格式字节数（显式逐字节，不含结构体填充） */
+#define DTC_ENTRY_WIRE_SIZE (4 + 1 + 1 + 1 + 1 + 4 + 4 + 4 + 1 + 1 + DTC_SNAPSHOT_MAX)
+
+/* 打包后最大长度：头 7 字节 + 满表 */
+#define DTC_BLOB_MAX (7u + DTC_ENTRY_WIRE_SIZE * DTC_MAX_ENTRIES)
+
+/*
+ * 打包。返回写入字节数，负值表示缓冲区不够。
+ * 空表也会写头（版本 + cycle + count=0），这样 cycle 能单独保存。
+ */
+int dtc_export(const dtc_store_t *st, uint8_t *buf, uint16_t size);
+
+/*
+ * 从字节恢复。返回恢复的条目数，负值表示数据不可用。
+ *
+ * 不可用的情形：版本不符、长度与 count 不符、count 超上限。
+ * 单条码不在当前定义表里时跳过该条（固件升级后码表可能变化），
+ * 不因此拒绝整块数据 —— 丢掉全部故障历史比丢一条更糟。
+ *
+ * 调用前需已 dtc_init（cfg 与 snapshot_fn 不会被覆盖）。
+ */
+int dtc_import(dtc_store_t *st, const uint8_t *buf, uint16_t len);
+
 #endif

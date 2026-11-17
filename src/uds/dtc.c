@@ -350,3 +350,168 @@ const char *dtc_name(const dtc_store_t *st, uint32_t code)
 
     return "UNKNOWN";
 }
+
+/* ---------------- 跨复位保持：序列化 ---------------- */
+
+/*
+ * 逐字节显式编码，理由和分区表、参数区一样：
+ * 结构体有对齐填充，sizeof 随编译器变化；这份数据要能被
+ * 下一次上电（可能是重新编译过的固件）读回来，布局必须固定。
+ */
+static void wire_put_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static uint32_t wire_get_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint8_t *wire_put_entry(uint8_t *p, const dtc_entry_t *e)
+{
+    wire_put_u32(p, e->code);
+    p[4] = e->status;
+    p[5] = e->occurrence;
+    p[6] = e->fail_cycles;
+    p[7] = e->aging_cycles;
+    wire_put_u32(p + 8, e->first_ms);
+    wire_put_u32(p + 12, e->last_ms);
+    wire_put_u32(p + 16, e->last_fail_cycle);
+    p[20] = e->snapshot_len;
+    p[21] = e->has_snapshot;
+    memcpy(p + 22, e->snapshot, DTC_SNAPSHOT_MAX);
+
+    return p + DTC_ENTRY_WIRE_SIZE;
+}
+
+static const uint8_t *wire_get_entry(const uint8_t *p, dtc_entry_t *e)
+{
+    memset(e, 0, sizeof(*e));
+
+    e->code = wire_get_u32(p) & 0xFFFFFFu;
+    e->status = p[4];
+    e->occurrence = p[5];
+    e->fail_cycles = p[6];
+    e->aging_cycles = p[7];
+    e->first_ms = wire_get_u32(p + 8);
+    e->last_ms = wire_get_u32(p + 12);
+    e->last_fail_cycle = wire_get_u32(p + 16);
+    e->snapshot_len = p[20];
+    e->has_snapshot = (uint8_t)(p[21] != 0);
+
+    /* 长度越界的快照不当真：宁可当作没有，也不要按越界长度去读 */
+    if (e->snapshot_len > DTC_SNAPSHOT_MAX)
+    {
+        e->snapshot_len = 0;
+        e->has_snapshot = 0;
+    }
+
+    if (e->has_snapshot)
+        memcpy(e->snapshot, p + 22, DTC_SNAPSHOT_MAX);
+
+    return p + DTC_ENTRY_WIRE_SIZE;
+}
+
+int dtc_export(const dtc_store_t *st, uint8_t *buf, uint16_t size)
+{
+    uint16_t need;
+
+    if (st == 0 || buf == 0)
+        return -1;
+
+    need = (uint16_t)(7u + DTC_ENTRY_WIRE_SIZE * st->count);
+
+    if (size < need)
+        return -1;
+
+    buf[0] = (uint8_t)DTC_BLOB_VERSION;
+    wire_put_u32(&buf[1], st->cycle);
+    buf[5] = (uint8_t)(st->count & 0xFF);
+    buf[6] = (uint8_t)(st->count >> 8);
+
+    {
+        uint8_t *p = &buf[7];
+
+        for (uint16_t i = 0; i < st->count; i++)
+            p = wire_put_entry(p, &st->entries[i]);
+    }
+
+    return (int)need;
+}
+
+int dtc_import(dtc_store_t *st, const uint8_t *buf, uint16_t len)
+{
+    uint16_t count;
+    uint16_t stored = 0;
+    const uint8_t *p;
+
+    if (st == 0 || buf == 0 || len < 7)
+        return -1;
+
+    if (buf[0] != DTC_BLOB_VERSION)
+        return -1;
+
+    count = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+
+    if (count > DTC_MAX_ENTRIES)
+        return -1;
+
+    /* 长度必须与 count 严格对上，宁可拒绝也不要读越界 */
+    if (len != (uint16_t)(7u + DTC_ENTRY_WIRE_SIZE * count))
+        return -1;
+
+    /*
+     * cycle 直接覆盖，不从 1 重新开始。
+     * 这一步不能省：老化判据是「连续 N 个循环」，跨复位时计数轴必须是同一根，
+     * 每次上电都归零等于老化永远不生效。
+     */
+    st->cycle = wire_get_u32(&buf[1]);
+
+    p = &buf[7];
+
+    for (uint16_t i = 0; i < count; i++)
+    {
+        dtc_entry_t e;
+
+        p = wire_get_entry(p, &e);
+
+        /*
+         * 码不在当前定义表里就跳过。
+         * 固件升级后码表可能变化，为一条不认识的码拒绝整块数据，
+         * 等于把全部故障历史和 cycle 一起丢掉。
+         */
+        if (!code_is_defined(st, e.code))
+            continue;
+
+        if (stored >= DTC_MAX_ENTRIES)
+            break;
+
+        /*
+         * 跨复位时只清这两个「描述刚才那次测试」的位，其余原样保留。
+         *
+         *   bit0 testFailed                 最近一次测试结果
+         *   bit1 testFailedThisOperationCycle  本循环失败过
+         *
+         * 留着 bit0，上电后第一次失败不会被判为上升沿，occurrence 少计一次。
+         * 留着 bit1，本轮老化结算会认为「这个循环失败过」，把 aging 清零。
+         *
+         * bit6（本循环没测）**不动**：它保存的是上次运行结束时的状态，
+         * 正是判断「上一个循环到底测没测过」的依据。
+         * 这里若强行置位或清零，等于替上一个循环编造结论 ——
+         * 传感器掉线的那些循环会被当成「测过且通过」，故障就会自己消失。
+         */
+        e.status &= (uint8_t)~(DTC_STATUS_TEST_FAILED |
+                               DTC_STATUS_TEST_FAILED_THIS_CYCLE);
+
+        st->entries[stored++] = e;
+    }
+
+    st->count = stored;
+
+    return (int)stored;
+}

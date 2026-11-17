@@ -2,32 +2,19 @@
 
 #include <string.h>
 
+#include "crc32.h"
+
 /* ---------------- CRC32 ---------------- */
 
-/*
- * 位运算版 CRC-32，不占查找表空间。Bootloader 对体积敏感，能省几百字节就省。
- * 内部用反码运算（crc = ~crc 进出），这样多次 update 的结果与一次性计算一致。
- */
+/* 实现放在 src/util/crc32.c，与 0x31 例程和参数区共用同一份 */
 uint32_t boot_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
-    if (data == 0 && len > 0)
-        return crc;
-
-    crc = ~crc;
-
-    for (uint32_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
-    }
-
-    return ~crc;
+    return crc32_update(crc, data, len);
 }
 
 uint32_t boot_crc32(const uint8_t *data, uint32_t len)
 {
-    return boot_crc32_update(0, data, len);
+    return crc32(data, len);
 }
 
 /* ---------------- 分区表序列化 ---------------- */

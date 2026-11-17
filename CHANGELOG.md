@@ -52,8 +52,21 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
   - `0x0202` checkMemory：start 时算 CRC32，requestResults 返回
 - `uds_routine_entry_t` 自定义例程表（start/stop/result 三个回调），
   参数语义由例程自己定义，协议层只透传
-- 内置例程的 CRC 与 `src/boot/boot.c` 的 `boot_crc32` 同一算法，
-  保证「诊断校验」和「Bootloader 跳转前校验」算的是同一个值
+- 内置例程的 CRC 与 `src/boot/boot.c` 的 `boot_crc32` 调用同一份实现
+  （`src/util/crc32.c`），保证「诊断校验」和「Bootloader 跳转前校验」算的是同一个值
+
+**参数与故障持久化**
+
+- `src/nvm/nvm.h` 参数区块设备接口（操作表注入，与 CAN 驱动同样的做法）
+- `src/nvm/nvm_store.c` 双页交替存储：擦除非当前页 → 写入 → 回读重算 CRC。
+  掉电在任意位置都至少有一页完整；`seq` 用有符号差值比较，回绕后仍能判新旧
+- `src/nvm/nvm_file.c` PC 侧文件实现，用于在没有硬件时验证掉电与损坏行为
+- `src/uds/dtc.c` 增加 `dtc_export` / `dtc_import`：序列化内容含操作循环号，
+  这是「连续 40 个循环老化」能跨复位成立的前提
+- `src/app/persist.c` 把参数与故障合成一个 blob，按关键状态签名控制写入频率
+- `src/util/crc32.c` 抽出公共 CRC32，Bootloader 与 0x31 例程不再各写一份
+- DID `0x0302` 暴露操作循环号与条目数，让「老化跨复位」可被外部观测
+- `tools/persist_interop.py` 自己启停 ecu-server，分四次上电验证跨复位行为
 
 **UDS 故障码（0x19 / 0x14）**
 
@@ -92,8 +105,9 @@ for (int i = 0; i < 50 && isotp_tx_busy(&tp); i++) { poll; usleep(500); }
 同一循环内重复失败只计一次、发生次数按沿计、快照只抓一次、静默循环不推进老化。
 `test/uds_dtc_test`（46 项）逐字节校验 `0x19` 五个子功能的响应格式与 `0x14` 的会话门槛。
 
-累计 437 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
-uds_transfer 51 / uds_routine 34 / dtc 54 / uds_dtc 46 / boot 40 / health 27）。
+累计 509 项单元测试通过（matrix 17 / driver 36 / isotp 84 / uds 48 /
+uds_transfer 51 / uds_routine 34 / dtc 54 / uds_dtc 46 / boot 40 / health 27 /
+nvm_store 35 / persist 22 / nvm_file 15）。
 
 真实链路：`make flash-interop` 用 udsoncan 刷 2048 字节（9 块），
 再用 `0x31` 让 ECU 自己算 CRC（`0x50DFCC83`），与本地 zlib 一致，

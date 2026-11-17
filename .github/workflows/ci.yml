@@ -71,6 +71,22 @@ jobs:
           grep -q "server reported a block length" /tmp/flash.log
           echo "flash interop verified"
 
+      # 参数与故障历史跨复位：脚本自己重启 ECU 进程，验证写下去的东西还在
+      - name: Persistence across restart
+        run: |
+          make persist-interop | tee /tmp/persist.log
+
+          grep -qE "Result: [0-9]+ passed, 0 failed" /tmp/persist.log
+          # 标定值必须活过重启
+          grep -q "threshold survives power cycle" /tmp/persist.log
+          # 操作循环号是连续累加的，不是每次上电从 1 开始
+          grep -q "operation cycle continues across restart" /tmp/persist.log
+          # 故障历史也要活过重启
+          grep -q "DTC survives power cycle" /tmp/persist.log
+          # 清码结果同样落盘
+          grep -q "cleared DTC stays cleared after restart" /tmp/persist.log
+          echo "persistence verified"
+
       # 故障码服务：让第三方栈触发真实的 ISO-TP 超时，再读码 / 读快照 / 清码
       - name: DTC interop over vcan
         run: |

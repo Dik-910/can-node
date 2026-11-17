@@ -37,6 +37,13 @@
 - 跳转前校验向量表与初始栈顶
 - 升级中断或校验失败时回滚到上一可用区
 
+### 参数与故障持久化
+
+- 标定参数（DID `0x0201`）与故障存储器写入 Flash 参数区，跨复位保持
+- 参数区双页交替写入，掉电时至少一页完整；写完回读重算 CRC 才认账
+- 操作循环号一并保存，否则「连续 40 个循环无故障才老化」跨不过上电周期
+- PC 侧用文件模拟 Flash，`make persist-interop` 重启进程验证真实跨复位行为
+
 ## 架构
 
 ```
@@ -136,8 +143,11 @@ src/bsp/           板级支持
 src/can/           CAN 驱动与收发（抽象层 + PC 桩 + SocketCAN）
 src/can/generated/ 由 DBC 生成的编解码代码，不要手改
 src/net/           ISO-TP
-src/uds/           UDS 服务与 DID 表
+src/uds/           UDS 服务、DID 表、故障存储
 src/boot/          Bootloader（分区表、CRC、跳转检查、升级流程）
+src/nvm/           参数区：块设备接口、双页存储、PC 侧文件实现
+src/util/          公共工具（CRC32，Bootloader / 0x31 / 参数区共用）
+src/app/           节点健康状态机、持久化打包
 test/              单元测试
 examples/          可运行的端到端示例
 docs/              协议与设计文档
@@ -161,7 +171,7 @@ make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口）
 ```
 
-`make test` 当前包含十套用例，共 437 项断言：
+`make test` 当前包含十三套用例，共 509 项断言：
 
 | 套件 | 覆盖内容 |
 |---|---|
@@ -175,6 +185,9 @@ make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口�
 | `test/uds_dtc_test` | `0x19` 五个子功能的逐字节响应格式、`0x14` 的会话门槛、无故障存储器时回 `NRC 0x11` |
 | `test/boot_test` | CRC32、分区表序列化、跳转检查、双区升级与回滚前提 |
 | `test/node_health_test` | 总线健康状态机：降级触发、Bus Off 计数窗口、恢复观察期、长期降级 |
+| `test/nvm_store_test` | 双页参数存储：交替写入、序号回绕、擦除后掉电、页头写一半掉电、CRC 损坏回退、两页都坏 |
+| `test/persist_test` | 跨复位持久化：参数与故障存活、老化跨 40 次上电推进、静默上电不推进老化、写频率控制 |
+| `test/nvm_file_test` | 参数区的文件实现：新建即擦除态、重开后读回、两次写入取最后一份 |
 
 ### 端到端演示
 
@@ -214,6 +227,9 @@ sudo ip link set up vcan0
 python3 tools/udsoncan_interop.py   # 基础诊断服务，14 项断言
 python3 tools/flash_interop.py      # 完整刷写 + CRC 交叉校验
 python3 tools/dtc_interop.py        # 故障码：读码 / 快照 / 清码
+
+# 跨复位：脚本自己重启 ecu-server，验证写下去的东西还在
+make persist-interop
 ```
 
 故障码互操作中的故障由协议栈自身判定，不依赖测试钩子：脚本发送首帧后停止，

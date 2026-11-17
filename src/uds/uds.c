@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "crc32.h"
+
 /*
  * UDS 服务层实现。
  *
@@ -523,22 +525,10 @@ static int handle_transfer_data(uds_server_t *srv, const uint8_t *req, uint16_t 
 /* ---------------- 0x31 例程控制 ---------------- */
 
 /*
- * CRC32，反射算法（多项式 0xEDB88320），与 src/boot/boot.c 一致。
- * 校验固件完整性和 Bootloader 跳转前算的是同一个值，不能各写一套。
+ * CRC32 用 src/util/crc32.c 的实现，与 src/boot/boot.c 是同一份代码
+ * （boot_crc32 现在只是它的薄封装）。校验固件完整性和 Bootloader 跳转前
+ * 算的是同一个值，不能各写一套。
  */
-static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
-{
-    crc = ~crc;
-
-    for (uint32_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
-    }
-
-    return ~crc;
-}
 
 /*
  * 内置例程的参数格式：addr(4 字节大端) + size(4 字节大端)。

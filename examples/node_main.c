@@ -13,6 +13,9 @@
 #include "src/can/generated/can_matrix.h"
 #include "src/net/isotp.h"
 #include "src/uds/uds.h"
+#include "src/nvm/nvm_file.h"
+#include "src/nvm/nvm_store.h"
+#include "src/app/persist.h"
 #include "src/app/node_health.h"
 
 /*
@@ -130,6 +133,14 @@ static int snap_provider(uint32_t code, uint8_t *out, uint8_t max_len)
 static uint16_t g_voltage_mv = 3660;
 static uint8_t g_threshold = 50;
 
+/* 参数区大小，与分区表一致（末页起 2KB） */
+#define PARAM_AREA_SIZE 2048u
+
+static nvm_file_ctx_t g_nvmf;
+static nvm_store_t g_nvm;
+static persist_t g_persist;
+static int g_persist_ready;
+
 static const uint8_t g_vin[17] = {'L', 'S', 'V', 'A', 'A', '1', '2', '3', '4',
                                   '5', '6', '7', '8', '9', '0', 'A', 'B'};
 
@@ -152,7 +163,16 @@ static int write_threshold(const uint8_t *in, uint8_t len)
 {
     if (len != 1)
         return -1;
+
     g_threshold = in[0];
+
+    /* 标定值写入立刻落盘：回了正响应就该是真的存下来了 */
+    if (g_persist_ready)
+    {
+        g_persist.params.threshold = g_threshold;
+        persist_save_now(&g_persist, (uint32_t)now_ms());
+    }
+
     return 0;
 }
 
@@ -242,12 +262,17 @@ int main(int argc, char **argv)
     uint8_t req[512], resp[512];
     uint16_t len = 0;
     uint64_t last_tick;
+    uint64_t last_persist;
     int seconds = 10;
+
+    const char *nvm_path = ".node-nvm.bin";
 
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             seconds = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--nvm") == 0 && i + 1 < argc)
+            nvm_path = argv[++i];
     }
 
     signal(SIGINT, on_signal);
@@ -289,12 +314,47 @@ int main(int argc, char **argv)
 
     uds_init(&srv, &ucfg);
 
+    /*
+     * 参数区。dtc_init 之后才能挂 —— 恢复故障条目时要用到定义表。
+     *
+     * 打开失败不阻止节点启动：参数区坏了还能跑，只是标定值回默认、
+     * 故障历史不保留。对车上的节点来说，能通信比保住历史重要。
+     */
+    {
+        persist_params_t def;
+
+        def.threshold = g_threshold;
+
+        if (nvm_file_open(&g_nvmf, nvm_path, PARAM_AREA_SIZE) != 0)
+        {
+            printf("[node] WARN: param area %s unavailable, running without persistence\n",
+                   nvm_path);
+        }
+        else if (nvm_store_mount(&g_nvm, nvm_file_dev(&g_nvmf)) != 0)
+        {
+            printf("[node] WARN: param area mount failed\n");
+            nvm_file_close(&g_nvmf);
+        }
+        else if (persist_mount(&g_persist, &g_nvm, &g_dtcs, &def, (uint32_t)now_ms()) == 0)
+        {
+            g_persist_ready = 1;
+
+            if (g_persist.params.threshold <= 0xFFu)
+                g_threshold = (uint8_t)g_persist.params.threshold;
+
+            printf("[node] param area: %s, threshold=%u, dtc entries=%u, cycle=%u\n",
+                   g_nvm.valid ? "restored" : "blank", g_threshold,
+                   (unsigned)g_dtcs.count, (unsigned)g_dtcs.cycle);
+        }
+    }
+
     memset(&node, 0, sizeof(node));
     node.node_state = 1; /* 正常 */
     node.start_ms = now_ms();
     node.last_status_ms = node.start_ms;
     node.last_bus_ms = node.start_ms;
     last_tick = node.start_ms;
+    last_persist = node.start_ms;
 
     node_health_init(&health);
     g_snap_health = &health;
@@ -435,7 +495,19 @@ int main(int argc, char **argv)
             }
         }
 
+        if (g_persist_ready && (now_ms() - last_persist) >= 1000)
+        {
+            persist_flush(&g_persist, (uint32_t)now_ms());
+            last_persist = now_ms();
+        }
+
         usleep(1000); /* 1ms 节拍 */
+    }
+
+    if (g_persist_ready)
+    {
+        persist_save_now(&g_persist, (uint32_t)now_ms());
+        nvm_file_close(&g_nvmf);
     }
 
     can_driver_deinit(&can);

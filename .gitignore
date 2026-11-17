@@ -36,4 +36,9 @@ Thumbs.db
 /bus-load
 /node
 /.ecu-*.log
+/.persist-ecu.log
+
+# 参数区（PC 侧由文件模拟 Flash，不该入库）
+*.nvm
+.nvm_file_test.bin
 /.dbg/

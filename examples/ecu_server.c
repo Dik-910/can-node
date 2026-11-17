@@ -12,6 +12,9 @@
 #include "src/can/can_driver_socketcan.h"
 #include "src/net/isotp.h"
 #include "src/uds/uds.h"
+#include "src/nvm/nvm_file.h"
+#include "src/nvm/nvm_store.h"
+#include "src/app/persist.h"
 
 /*
  * 常驻 ECU：在 vcan0 上等诊断请求，处理完回响应。
@@ -36,10 +39,23 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
+static uint32_t now_ms32(void);
+
 /* ---------------- ECU 侧的假数据 ---------------- */
 
 static uint16_t g_voltage_mv = 3660;
 static uint8_t g_threshold = 50;
+
+/*
+ * 参数区大小。与 docs/design.md 的分区表一致（末页起 2KB）。
+ * 刷写流程只操作 App 分区，不会碰这里。
+ */
+#define PARAM_AREA_SIZE 2048u
+
+static nvm_file_ctx_t g_nvmf;
+static nvm_store_t g_nvm;
+static persist_t g_persist;
+static int g_persist_ready;
 
 static const uint8_t g_vin[17] = {'L', 'S', 'V', 'A', 'A', '1', '2', '3', '4',
                                   '5', '6', '7', '8', '9', '0', 'A', 'B'};
@@ -63,7 +79,23 @@ static int write_threshold(const uint8_t *in, uint8_t len)
 {
     if (len != 1)
         return -1;
+
     g_threshold = in[0];
+
+    /*
+     * 立刻落盘，不等主循环的定时 flush。
+     *
+     * 标定值写入是低频、用户主动的动作，值得马上写；
+     * 而「等下一次定时保存」的窗口里如果掉电，诊断仪已经回了正响应，
+     * 用户却以为参数已经生效——这种不一致比多写一次 Flash 代价大。
+     */
+    if (g_persist_ready)
+    {
+        g_persist.params.threshold = g_threshold;
+        if (persist_save_now(&g_persist, now_ms32()) < 0)
+            printf("[ecu] WARN: threshold saved to RAM only (nvm write failed)\n");
+    }
+
     printf("[ecu] threshold updated to %u\n", g_threshold);
     fflush(stdout);
     return 0;
@@ -173,11 +205,15 @@ static int read_flash_digest(uint8_t *out, uint8_t *out_len)
     return 0;
 }
 
+/* 定义在故障码段落（要访问 g_dtcs），这里只做前置声明 */
+static int read_dtc_stats(uint8_t *out, uint8_t *out_len);
+
 static const uds_did_entry_t g_dids[] = {
     {0xF190, 17, g_vin, 0, 0, UDS_SESSION_DEFAULT, 0},  /* VIN，17 字节走多帧 */
     {0x0101, 0, 0, read_voltage, 0, UDS_SESSION_DEFAULT, 0},
     {0x0201, 0, 0, read_threshold, write_threshold, UDS_SESSION_EXTENDED, 1},
     {0x0301, 0, 0, read_flash_digest, 0, UDS_SESSION_DEFAULT, 0},  /* 刷写摘要 */
+    {0x0302, 0, 0, read_dtc_stats, 0, UDS_SESSION_DEFAULT, 0},     /* 循环号与条目数 */
 };
 
 static void print_bytes(const char *tag, const uint8_t *d, int n)
@@ -213,6 +249,28 @@ static const dtc_def_t g_dtc_defs[] = {
 };
 
 static dtc_store_t g_dtcs;
+
+/*
+ * 故障存储的统计量：操作循环号 + 已记录条目数。
+ *
+ * 循环号存在的意义是让「老化跨复位」这件事可观测 ——
+ * 0x19 只能看到故障本身，看不到它在数第几个循环。
+ * 上位机或测试脚本读这个值，就能确认周期号是接着上次的，而不是每次上电从 1 开始。
+ */
+static int read_dtc_stats(uint8_t *out, uint8_t *out_len)
+{
+    uint32_t cycle = g_dtcs.cycle;
+
+    out[0] = (uint8_t)(cycle >> 24);
+    out[1] = (uint8_t)(cycle >> 16);
+    out[2] = (uint8_t)(cycle >> 8);
+    out[3] = (uint8_t)cycle;
+    out[4] = (uint8_t)(g_dtcs.count >> 8);
+    out[5] = (uint8_t)g_dtcs.count;
+    *out_len = 6;
+    return 0;
+}
+
 static uint32_t g_boot_ms;
 static int g_last_isotp_rc;
 
@@ -284,6 +342,8 @@ int main(int argc, char **argv)
     uint16_t len = 0;
     int seconds = 30;
     const char *ifname = "vcan0";
+    const char *nvm_path = ".ecu-nvm.bin";
+    int nvm_reset = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -291,6 +351,10 @@ int main(int argc, char **argv)
             seconds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--if") == 0 && i + 1 < argc)
             ifname = argv[++i];
+        else if (strcmp(argv[i], "--nvm") == 0 && i + 1 < argc)
+            nvm_path = argv[++i];
+        else if (strcmp(argv[i], "--nvm-reset") == 0)
+            nvm_reset = 1;
     }
 
     signal(SIGINT, on_signal);
@@ -331,6 +395,59 @@ int main(int argc, char **argv)
     uds_init(&srv, &ucfg);
 
     g_boot_ms = now_ms32();
+
+    /*
+     * 参数区。放在 dtc_init 之后、主循环之前。
+     *
+     * 顺序有讲究：persist_mount 会把存储里的故障条目恢复进 g_dtcs，
+     * 所以 dtc 必须先 init 好 cfg（定义表）—— 没有定义表就判断不了
+     * 哪些码是认识的。
+     */
+    {
+        persist_params_t def;
+
+        if (nvm_file_open(&g_nvmf, nvm_path, PARAM_AREA_SIZE) != 0)
+        {
+            printf("cannot open param area %s\n", nvm_path);
+            can_driver_deinit(&can);
+            return 1;
+        }
+
+        if (nvm_reset)
+        {
+            /* 模拟一块新板子：参数区按擦除态起步 */
+            g_nvmf.dev.erase(g_nvmf.dev.ctx, 0, g_nvmf.dev.size);
+            printf("[ecu] param area erased (%s)\n", nvm_path);
+        }
+
+        if (nvm_store_mount(&g_nvm, nvm_file_dev(&g_nvmf)) != 0)
+        {
+            printf("cannot mount param area\n");
+            can_driver_deinit(&can);
+            return 1;
+        }
+
+        def.threshold = g_threshold;
+        if (persist_mount(&g_persist, &g_nvm, &g_dtcs, &def, now_ms32()) != 0)
+        {
+            printf("cannot mount persisted state\n");
+            can_driver_deinit(&can);
+            return 1;
+        }
+
+        g_persist_ready = 1;
+
+        /* 恢复上一次写入的标定值 */
+        if (g_persist.params.threshold <= 0xFFu)
+            g_threshold = (uint8_t)g_persist.params.threshold;
+
+        printf("[ecu] param area %s: %s, threshold=%u, dtc entries=%u, cycle=%u\n",
+               nvm_path,
+               g_nvm.valid ? "restored" : "blank",
+               g_threshold,
+               (unsigned)g_dtcs.count,
+               (unsigned)g_dtcs.cycle);
+    }
 
     printf("[ecu] listening on %s, req=0x%03X rsp=0x%03X, %d s\n",
            ifname, ID_REQUEST, ID_RESPONSE, seconds);
@@ -435,9 +552,28 @@ int main(int argc, char **argv)
 
         /* S3 会话计时需要推进 */
         uds_tick(&srv, 1);
+
+        /*
+         * 每秒检查一次是否需要落盘。
+         * 真正的写频率由 persist 内部的关键状态签名控制 ——
+         * 故障的 status 位每 10ms 就变，逐字节比较会一天写两万次。
+         */
+        if ((tick % 1000) == 0 && g_persist_ready)
+            persist_flush(&g_persist, now_ms32());
+
         usleep(1000);
     }
 
+    /* 正常退出前保存：否则这一段跑出来的故障历史就白记了 */
+    if (g_persist_ready)
+    {
+        persist_save_now(&g_persist, now_ms32());
+        printf("[ecu] persisted: threshold=%u, dtc entries=%u, cycle=%u, writes=%u\n",
+               g_threshold, (unsigned)g_dtcs.count, (unsigned)g_dtcs.cycle,
+               (unsigned)g_persist.writes);
+    }
+
+    nvm_file_close(&g_nvmf);
     can_driver_deinit(&can);
     printf("[ecu] exit\n");
     return 0;
