@@ -100,12 +100,22 @@ class Ecu:
             return f.read()
 
 
+def our_key_algo(level, seed, params):
+    """与 can-node/src/uds/uds.c 里的 default_key 保持一致"""
+    seed_int = int.from_bytes(seed, "big")
+    key = ((seed_int ^ 0x5A5A5A5A) + 0x12345678) & 0xFFFFFFFF
+    return key.to_bytes(4, "big")
+
+
 def open_client(bus, addr):
     stack = isotp.CanStack(bus=bus, address=addr,
                            params={"blocksize": 8, "stmin": 5})
     conn = PythonIsoTpConnection(stack)
 
     cfg = dict(default_client_config)
+    cfg["security_algo"] = our_key_algo
+    cfg["security_algo_params"] = None
+
     # 不声明格式的话，udsoncan 在读之前就会抛 ConfigError，
     # 请求根本不会发出去。1 字节按无符号整型解，6 字节的统计量取原始字节。
     cfg["data_identifiers"] = {
@@ -113,6 +123,16 @@ def open_client(bus, addr):
         DID_DTC_STATS: "6s",
     }
     return Client(conn, request_timeout=5, config=cfg)
+
+
+def enter_extended_and_unlock(client):
+    """
+    0x0201 在 DID 表里声明为「扩展会话 + 需解锁」。
+    这是刻意的：标定值不是随便能读的，产线和售后的权限不同。
+    直接读会拿到 NRC 0x22（conditionsNotCorrect）。
+    """
+    client.change_session(0x03)
+    client.unlock_security_access(1)
 
 
 def read_threshold(client):
@@ -168,6 +188,8 @@ def main():
     ecu = Ecu(reset=True)
     try:
         with open_client(bus, addr) as client:
+            enter_extended_and_unlock(client)
+
             got = read_threshold(client)
             check(got == DEFAULT_THRESHOLD, "fresh board uses the default threshold",
                   f"got {got}")
@@ -191,6 +213,8 @@ def main():
     ecu = Ecu(reset=False)
     try:
         with open_client(bus, addr) as client:
+            enter_extended_and_unlock(client)
+
             got = read_threshold(client)
             check(got == NEW_THRESHOLD,
                   "threshold survives power cycle", f"got {got}")
@@ -227,14 +251,15 @@ def main():
             check(cycle_c == cycle_b + 1,
                   "cycle keeps increasing", f"{cycle_b} -> {cycle_c}")
 
+            enter_extended_and_unlock(client)
             threshold = read_threshold(client)
             check(threshold == NEW_THRESHOLD,
                   "threshold still intact after second restart",
                   f"got {threshold}")
 
             # 清码后重启，故障应真的消失（证明清码也落盘了）。
-            # 0x14 要求扩展会话，默认会话会被拒成 NRC 0x22。
-            client.change_session(0x03)
+            # 0x14 要求扩展会话，默认会话会被拒成 NRC 0x22；
+            # enter_extended_and_unlock 已经切过去了。
             client.clear_dtc(0xFFFFFF)
             check(dtc_codes(client) == [], "clear removes the DTC",
                   f"{[hex(c) for c in dtc_codes(client)]}")
