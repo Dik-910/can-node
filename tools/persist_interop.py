@@ -135,14 +135,25 @@ def enter_extended_and_unlock(client):
     client.unlock_security_access(1)
 
 
+def did_value(resp, did):
+    """
+    udsoncan 对 struct 格式的 DID 返回 tuple：
+      "B"  -> (61,)
+      "6s" -> (b'\x00\x00\x00\x01\x00\x01',)
+    多 DID 一次读时又可能是扁平值。两种都处理掉。
+    """
+    v = resp.service_data.values[did]
+    return v[0] if isinstance(v, tuple) else v
+
+
 def read_threshold(client):
     resp = client.read_data_by_identifier(DID_THRESHOLD)
-    return resp.service_data.values[DID_THRESHOLD]
+    return did_value(resp, DID_THRESHOLD)
 
 
 def read_dtc_stats(client):
     resp = client.read_data_by_identifier(DID_DTC_STATS)
-    raw = resp.service_data.values[DID_DTC_STATS]
+    raw = did_value(resp, DID_DTC_STATS)
     cycle = int.from_bytes(raw[0:4], "big")
     count = int.from_bytes(raw[4:6], "big")
     return cycle, count
