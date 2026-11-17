@@ -70,11 +70,15 @@ static void power_on(board_t *b, uint32_t now_ms)
     memset(&b->dtcs, 0, sizeof(b->dtcs));
     dtc_init(&b->dtcs, &cfg);
 
+    /*
+     * 走 persist_boot 而不是手动拼 mount 序列 —— 与 ecu_server / node_main
+     * 的实际启动路径保持一致。曾经因为「先取 dev 再挂载」写错，
+     * ECU 一启动就跳 NULL，而那时没有任何测试覆盖这条序列。
+     */
     memset(&b->nvm, 0, sizeof(b->nvm));
-    nvm_store_mount(&b->nvm, mem_nvm_dev(&b->mem));
-
     memset(&b->persist, 0, sizeof(b->persist));
-    persist_mount(&b->persist, &b->nvm, &b->dtcs, &DEF_PARAMS, now_ms);
+    persist_boot(&b->persist, &b->nvm, mem_nvm_dev(&b->mem), 0,
+                 &b->dtcs, &DEF_PARAMS, now_ms);
 
     /* 上电即一个新循环，与真实节点的启动顺序一致 */
     dtc_operation_cycle(&b->dtcs);
@@ -341,6 +345,83 @@ static void test_bad_version(void)
           "版本不认识则回默认", b.persist.params.threshold, DEF_PARAMS.threshold);
 }
 
+/* ---- 引导序列本身 ---- */
+
+static void test_boot_reset(void)
+{
+    board_t b;
+
+    printf("reset 启动等价于新板子\n");
+
+    mem_nvm_init(&b.mem, AREA_SIZE);
+    power_on(&b, 0);
+
+    b.persist.params.threshold = 61u;
+    persist_save_now(&b.persist, 100);
+
+    /* 不 reset 时能读到 61，说明上面确实落下去了 */
+    power_on(&b, 200);
+    check(b.persist.params.threshold == 61u, "reset 之前是 61",
+          b.persist.params.threshold, 61);
+
+    /* 用 reset 启动：参数区被擦掉，回到默认 */
+    {
+        dtc_config_t cfg;
+
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.defs = g_defs;
+        cfg.def_count = (uint16_t)(sizeof(g_defs) / sizeof(g_defs[0]));
+
+        memset(&b.dtcs, 0, sizeof(b.dtcs));
+        dtc_init(&b.dtcs, &cfg);
+        memset(&b.nvm, 0, sizeof(b.nvm));
+        memset(&b.persist, 0, sizeof(b.persist));
+
+        check(persist_boot(&b.persist, &b.nvm, mem_nvm_dev(&b.mem), 1,
+                           &b.dtcs, &DEF_PARAMS, 400) == 0, "reset 启动成功", 0, 0);
+        check(b.persist.params.threshold == DEF_PARAMS.threshold,
+              "reset 后回到默认值", b.persist.params.threshold, DEF_PARAMS.threshold);
+        /*
+         * count 不会是 0：dtc_init 会为定义表里每条码建一条空记录，
+         * 否则 0x19 0A（报支持的码）在无故障时返回空列表。
+         * 要断言的是「没有确认的故障」。
+         */
+        check(dtc_count_by_mask(&b.dtcs, DTC_STATUS_CONFIRMED) == 0,
+              "reset 后没有确认的故障", dtc_count_by_mask(&b.dtcs, DTC_STATUS_CONFIRMED), 0);
+        check(b.dtcs.count == 2, "空记录数等于定义表条数", b.dtcs.count, 2);
+    }
+}
+
+static void test_boot_rejects_bad_device(void)
+{
+    persist_t p;
+    nvm_store_t nvm;
+    dtc_store_t dtcs;
+    dtc_config_t cfg;
+
+    printf("设备接口不完整时拒绝启动\n");
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.defs = g_defs;
+    cfg.def_count = (uint16_t)(sizeof(g_defs) / sizeof(g_defs[0]));
+    memset(&dtcs, 0, sizeof(dtcs));
+    dtc_init(&dtcs, &cfg);
+
+    check(persist_boot(&p, &nvm, 0, 0, &dtcs, &DEF_PARAMS, 0) != 0,
+          "空设备应拒绝", 1, 0);
+
+    {
+        /* 只有 size、没有函数表的设备同样要拒绝，而不是等运行时跳 NULL */
+        static nvm_dev_t hollow;
+
+        memset(&hollow, 0, sizeof(hollow));
+        hollow.size = 2048;
+
+        check(persist_boot(&p, &nvm, &hollow, 0, &dtcs, &DEF_PARAMS, 0) != 0,
+              "函数表为空应拒绝", 1, 0);
+    }
+}
+
 int main(void)
 {
     printf("=== persist_test ===\n");
@@ -353,6 +434,8 @@ int main(void)
     test_write_rate();
     test_corrupt_data_uses_defaults();
     test_bad_version();
+    test_boot_reset();
+    test_boot_rejects_bad_device();
 
     printf("\nResult: %d passed, %d failed\n", g_total, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -404,7 +404,10 @@ int main(int argc, char **argv)
      * 哪些码是认识的。
      */
     {
+        const nvm_dev_t *dev;
         persist_params_t def;
+
+        def.threshold = g_threshold;
 
         if (nvm_file_open(&g_nvmf, nvm_path, PARAM_AREA_SIZE) != 0)
         {
@@ -413,27 +416,20 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (nvm_reset)
-        {
-            /* 模拟一块新板子：参数区按擦除态起步 */
-            g_nvmf.dev.erase(g_nvmf.dev.ctx, 0, g_nvmf.dev.size);
-            printf("[ecu] param area erased (%s)\n", nvm_path);
-        }
+        /* nvm_file_dev 负责填函数表，persist_boot 才敢调 dev->erase */
+        dev = nvm_file_dev(&g_nvmf);
 
-        if (nvm_store_mount(&g_nvm, nvm_file_dev(&g_nvmf)) != 0)
+        if (persist_boot(&g_persist, &g_nvm, dev, nvm_reset, &g_dtcs,
+                         &def, now_ms32()) != 0)
         {
             printf("cannot mount param area\n");
+            nvm_file_close(&g_nvmf);
             can_driver_deinit(&can);
             return 1;
         }
 
-        def.threshold = g_threshold;
-        if (persist_mount(&g_persist, &g_nvm, &g_dtcs, &def, now_ms32()) != 0)
-        {
-            printf("cannot mount persisted state\n");
-            can_driver_deinit(&can);
-            return 1;
-        }
+        if (nvm_reset)
+            printf("[ecu] param area erased (%s)\n", nvm_path);
 
         g_persist_ready = 1;
 

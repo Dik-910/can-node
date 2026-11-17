@@ -330,12 +330,13 @@ int main(int argc, char **argv)
             printf("[node] WARN: param area %s unavailable, running without persistence\n",
                    nvm_path);
         }
-        else if (nvm_store_mount(&g_nvm, nvm_file_dev(&g_nvmf)) != 0)
+        else if (persist_boot(&g_persist, &g_nvm, nvm_file_dev(&g_nvmf), 0,
+                              &g_dtcs, &def, (uint32_t)now_ms()) != 0)
         {
             printf("[node] WARN: param area mount failed\n");
             nvm_file_close(&g_nvmf);
         }
-        else if (persist_mount(&g_persist, &g_nvm, &g_dtcs, &def, (uint32_t)now_ms()) == 0)
+        else
         {
             g_persist_ready = 1;
 

@@ -171,7 +171,7 @@ make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口）
 ```
 
-`make test` 当前包含十三套用例，共 509 项断言：
+`make test` 当前包含十三套用例，共 516 项断言：
 
 | 套件 | 覆盖内容 |
 |---|---|

@@ -164,6 +164,25 @@ static int do_save(persist_t *p, uint32_t now_ms)
 
 /* ---------------- 对外接口 ---------------- */
 
+int persist_boot(persist_t *p, nvm_store_t *nvm, const nvm_dev_t *dev,
+                 int reset, dtc_store_t *dtcs,
+                 const persist_params_t *def, uint32_t now_ms)
+{
+    if (p == 0 || nvm == 0 || dev == 0 || dtcs == 0 || def == 0)
+        return -1;
+
+    if (dev->erase == 0 || dev->read == 0 || dev->write == 0)
+        return -1;
+
+    if (reset && dev->erase(dev->ctx, 0, dev->size) != 0)
+        return -1;
+
+    if (nvm_store_mount(nvm, dev) != 0)
+        return -1;
+
+    return persist_mount(p, nvm, dtcs, def, now_ms);
+}
+
 int persist_mount(persist_t *p, nvm_store_t *nvm, dtc_store_t *dtcs,
                   const persist_params_t *def, uint32_t now_ms)
 {

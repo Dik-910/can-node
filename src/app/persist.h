@@ -64,6 +64,20 @@ typedef struct
 } persist_t;
 
 /*
+ * 上电引导：挂载块设备 → 恢复状态。
+ *
+ * 这个序列（擦除？挂载？恢复？）在 ecu_server 和 node_main 里各写过一遍，
+ * 结果两边都写错过一次：直接访问 dev->erase，而此时 dev 的函数表还没被
+ * nvm_file_dev 填充，一执行就跳 NULL。抽到这里以后有单测盯着。
+ *
+ * reset 非 0 时先把整个参数区擦除，等价于一块新板子。
+ * 返回 0 成功，负值表示设备不可用 —— 调用方应当降级运行而不是退出。
+ */
+int persist_boot(persist_t *p, nvm_store_t *nvm, const nvm_dev_t *dev,
+                 int reset, dtc_store_t *dtcs,
+                 const persist_params_t *def, uint32_t now_ms);
+
+/*
  * 挂载。nvm 必须已经 nvm_store_mount 过（那一层会重置自身状态，
  * 两者顺序反了会把刚读到的数据清掉）。
  *
