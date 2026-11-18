@@ -170,8 +170,56 @@ def main():
                 check(len(s.raw_data) == 5, "snapshot payload is 5 bytes",
                       s.raw_data.hex())
 
+        # ---------- 4b. 快照标识与按记录号读取 ----------
+        #
+        # 03 是 04 的前置：先问「哪些码有快照、用的几号记录」，才谈得上按需读。
+        # udsoncan 把 03 的记录解析成 DTC+状态（记录号那一字节没单独暴露），
+        # 所以这里直接校验原始载荷 —— 规范定义的本来就是这 4 个字节。
+        print("\n0x19 03 report snapshot identification")
+        resp = client.read_dtc_information(3)
+        raw = resp.get_payload()
+
+        check(raw[:2] == b"\x59\x03", "positive response 59 03", raw.hex())
+        check(len(raw) == 6, "one record -> 2 + 4 bytes", raw.hex())
+
+        want = bytes([(DTC_TIMEOUT >> 16) & 0xFF, (DTC_TIMEOUT >> 8) & 0xFF,
+                      DTC_TIMEOUT & 0xFF])
+        check(raw[2:5] == want, "record names the DTC that has a snapshot",
+              raw[2:5].hex())
+        check(raw[5] == 0x01, "record number is 1", f"0x{raw[5]:02X}")
+        check(resp.service_data.dtc_count == 1, "udsoncan counts one record")
+
+        # 05 是同一个内容的另一个入口：不经过 DTC，按记录号直接读。
+        # 两个入口读到的东西必须一致，否则 04 和 05 其中之一编码错了。
+        print("\n0x19 05 report stored data by record number")
+        resp = client.read_dtc_information(5, snapshot_record_number=0x01)
+        sd = resp.service_data
+
+        check(sd.subfunction_echo == 5, "subfunction echoed", f"0x{sd.subfunction_echo:02X}")
+        check(len(sd.dtcs) == 1 and int(sd.dtcs[0].id) == DTC_TIMEOUT,
+              "record holds the expected DTC",
+              f"{[hex(int(d.id)) for d in sd.dtcs]}")
+
+        if sd.dtcs:
+            snaps = sd.dtcs[0].snapshots
+            check(len(snaps) == 1, "one DID decoded from the record",
+                  f"{[hex(s.did) for s in snaps]}")
+            if snaps:
+                s = snaps[0]
+                check(s.did == DID_FAULT_CONTEXT, "record DID matches the 04 path",
+                      f"0x{s.did:04X}")
+                check(len(s.raw_data) == 5, "record payload is 5 bytes",
+                      s.raw_data.hex())
+
+        # 不存在的记录号必须回 0x31，不能拿空响应糊过去
+        try:
+            client.read_dtc_information(5, snapshot_record_number=0x02)
+            check(False, "unknown record number must be rejected")
+        except NegativeResponseException as e:
+            check(e.response.code == 0x31, "unknown record number -> NRC 0x31",
+                  f"0x{e.response.code:02X}")
+
         # ---------- 5. 清码的会话门槛 ----------
-        print("\n0x14 clear diagnostic information")
         try:
             client.clear_dtc(0xFFFFFF)
             check(False, "clear in default session must be rejected")

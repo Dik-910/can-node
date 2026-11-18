@@ -47,6 +47,17 @@
 /* 快照（freeze frame）最大长度。真实项目一般存 10~30 字节的工况数据 */
 #define DTC_SNAPSHOT_MAX 24
 
+/*
+ * 快照内容的布局（对上层是约定，dtc 层只当字节数组搬运）：
+ *
+ *   [0]        identifier 个数 n
+ *   [1..]      n 组 (DID 高字节 DID 低字节 数据...)
+ *
+ * 必须是这个结构，不能存裸字节：0x19 04 和 0x19 05 的响应里都要求
+ * 「numberOfIdentifiers 后面跟若干组 DID+数据」，裸字节没有 DID 就编不出来，
+ * tester 也没法知道每段数据是什么。
+ */
+
 /* 表容量。超出直接丢弃并返回错误，不动态分配 —— 车规代码不做堆 */
 #define DTC_MAX_ENTRIES 16
 

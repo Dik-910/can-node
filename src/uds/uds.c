@@ -901,6 +901,110 @@ static int read_dtc_list(uds_server_t *srv, uint8_t *resp, uint16_t size,
     return (int)pos;
 }
 
+/*
+ * 0x19 03：告诉 tester「哪些 DTC 有快照、用的是几号记录」。
+ *
+ * 这一条是 0x19 04 的前置。没有它，tester 只能盲猜记录号，猜错就吃 0x31；
+ * 有了它才能先枚举、再按需读内容。
+ *
+ * 响应：59 03 (DTC 3 字节 + 记录号 1 字节) × N
+ */
+static int read_dtc_snapshot_id(uds_server_t *srv, uint8_t *resp, uint16_t size)
+{
+    uint16_t pos = 0;
+    uint8_t head[2];
+
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = UDS_DTC_REPORT_SNAPSHOT_ID;
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+
+    for (uint16_t i = 0; i < srv->cfg.dtcs->count; i++)
+    {
+        const dtc_entry_t *e = dtc_get(srv->cfg.dtcs, i);
+        uint8_t item[4];
+
+        if (e == 0 || !e->has_snapshot)
+            continue;
+
+        put_dtc(item, e->code);
+        item[3] = UDS_DTC_RECORD_SNAPSHOT;
+
+        if (append(resp, size, &pos, item, sizeof(item)) != 0)
+            return -1;
+    }
+
+    /* 一条都没有时不下发 NRC：空列表本身就是「没有快照」的答案 */
+    return (int)pos;
+}
+
+/*
+ * 0x19 05：按记录号读，不经过 DTC。
+ *
+ * 与 0x19 04 的区别只有入口：04 要先知道是哪个 DTC，05 只要记录号。
+ * 用在「不管哪个码，先把 1 号记录都给我」这类场景。
+ *
+ * 响应：59 05 <记录号> (DTC 3 字节 + 状态 + 快照) × N
+ * 快照本身以 identifier 个数开头，正好接在状态字节后面，见 dtc.h 的布局说明。
+ */
+static int read_dtc_stored_data(uds_server_t *srv, uint8_t *resp, uint16_t size,
+                                const uint8_t *req)
+{
+    uint8_t record = req[2];
+    uint16_t pos = 0;
+    uint8_t head[3];
+    int found = 0;
+
+    /* 本实现每个码只有一个记录（1 号，即快照）；0xFF 表示要全部记录 */
+    if (record != UDS_DTC_RECORD_SNAPSHOT && record != UDS_DTC_RECORD_ALL)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    for (uint16_t i = 0; i < srv->cfg.dtcs->count; i++)
+    {
+        const dtc_entry_t *e = dtc_get(srv->cfg.dtcs, i);
+
+        if (e != 0 && e->has_snapshot)
+        {
+            found = 1;
+            break;
+        }
+    }
+
+    /*
+     * 一条记录都没有才回 0x31：空响应会让 tester 以为「读了但什么都没有」，
+     * 而实际含义是「这个记录号不存在」。两件事必须分开。
+     */
+    if (!found)
+        return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_REQUEST_OUT_OF_RANGE);
+
+    head[0] = UDS_SID_READ_DTC + POS_OFFSET;
+    head[1] = UDS_DTC_REPORT_STORED_DATA;
+    head[2] = record;
+
+    if (append(resp, size, &pos, head, sizeof(head)) != 0)
+        return -1;
+
+    for (uint16_t i = 0; i < srv->cfg.dtcs->count; i++)
+    {
+        const dtc_entry_t *e = dtc_get(srv->cfg.dtcs, i);
+        uint8_t item[4];
+
+        if (e == 0 || !e->has_snapshot)
+            continue;
+
+        put_dtc(item, e->code);
+        item[3] = e->status;
+
+        if (append(resp, size, &pos, item, sizeof(item)) != 0)
+            return -1;
+        if (append(resp, size, &pos, e->snapshot, e->snapshot_len) != 0)
+            return -1;
+    }
+
+    return (int)pos;
+}
+
 static int read_dtc_snapshot(uds_server_t *srv, uint8_t *resp, uint16_t size,
                              const uint8_t *req)
 {
@@ -1005,10 +1109,20 @@ static int handle_read_dtc(uds_server_t *srv, const uint8_t *req, uint16_t len,
             return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
         return read_dtc_list(srv, resp, size, req, sub);
 
+    case UDS_DTC_REPORT_SNAPSHOT_ID:
+        if (len != 2)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_snapshot_id(srv, resp, size);
+
     case UDS_DTC_REPORT_SNAPSHOT:
         if (len != 6)
             return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
         return read_dtc_snapshot(srv, resp, size, req);
+
+    case UDS_DTC_REPORT_STORED_DATA:
+        if (len != 3)
+            return send_negative(resp, size, UDS_SID_READ_DTC, UDS_NRC_INCORRECT_LENGTH);
+        return read_dtc_stored_data(srv, resp, size, req);
 
     case UDS_DTC_REPORT_EXT_DATA:
         if (len != 6)

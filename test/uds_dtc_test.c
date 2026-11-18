@@ -53,15 +53,20 @@ static dtc_store_t g_dtcs;
 static int snap_provider(uint32_t code, uint8_t *out, uint8_t max_len)
 {
     (void)code;
-    if (max_len < 4)
+    if (max_len < 6)
         return 0;
 
-    /* 模拟故障瞬间的工况：电压高字节 + TEC 高字节 */
-    out[0] = 0x0E; /* 3.6V */
+    /*
+     * 按 dtc.h 约定的布局：identifier 个数 + (DID 高 DID 低 数据...)
+     * 故障瞬间的工况：DID 0x0001 = 故障上下文，内容是电压高字节 + TEC
+     */
+    out[0] = 1;              /* 一组 DID */
     out[1] = 0x00;
-    out[2] = 0x00;
-    out[3] = 0x80; /* TEC = 128 */
-    return 4;
+    out[2] = 0x01;           /* DID 0x0001 */
+    out[3] = 0x0E;           /* 3.6V */
+    out[4] = 0x00;
+    out[5] = 0x80;           /* TEC = 128 */
+    return 6;
 }
 
 /* 把服务器切到扩展会话，很多服务的前置条件 */
@@ -206,17 +211,19 @@ static void test_snapshot(void)
     req[5] = UDS_DTC_RECORD_SNAPSHOT;
 
     n = uds_handle_request(&srv, req, 6, resp, sizeof(resp));
-    check(n == 11, "response = 7 header bytes + 4 snapshot bytes");
+    check(n == 13, "response = 7 header bytes + 6 snapshot bytes");
     check(resp[0] == 0x59 && resp[1] == 0x04, "positive response 59 04");
     check(resp[2] == 0xC0 && resp[3] == 0x01 && resp[4] == 0x87, "DTC echoed");
     check(resp[5] == dtc_find(&g_dtcs, DTC_BUS_OFF)->status, "status echoed between DTC and record");
     check(resp[6] == UDS_DTC_RECORD_SNAPSHOT, "record number normalised to 0x01");
-    check(resp[7] == 0x0E && resp[10] == 0x80, "snapshot payload follows the header");
+    check(resp[7] == 1, "identifier count comes first in the snapshot");
+    check(resp[8] == 0x00 && resp[9] == 0x01, "identifier is a DID");
+    check(resp[10] == 0x0E && resp[12] == 0x80, "snapshot payload follows the header");
 
     /* 0xFF 表示「全部记录」，只有一条时行为相同 */
     req[5] = UDS_DTC_RECORD_ALL;
     n = uds_handle_request(&srv, req, 6, resp, sizeof(resp));
-    check(n == 11 && resp[6] == UDS_DTC_RECORD_SNAPSHOT,
+    check(n == 13 && resp[6] == UDS_DTC_RECORD_SNAPSHOT,
           "record 0xFF reports record 1 for a single-record DTC");
 
     /* 记录号 0x02 不存在 */
@@ -239,6 +246,93 @@ static void test_snapshot(void)
     n = uds_handle_request(&srv, req, 6, resp, sizeof(resp));
     check(n == 3 && resp[2] == UDS_NRC_REQUEST_OUT_OF_RANGE,
           "unknown DTC -> NRC 0x31");
+}
+
+static void test_snapshot_id(void)
+{
+    uds_server_t srv;
+    uint8_t resp[64];
+    uint8_t req[2] = {UDS_SID_READ_DTC, UDS_DTC_REPORT_SNAPSHOT_ID};
+    int n;
+
+    printf("[0x19 03 report snapshot identification]\n");
+    dtc_set_snapshot_provider(&g_dtcs, snap_provider);
+    with_dtcs(&srv);
+    dtc_clear(&g_dtcs, DTC_GROUP_ALL);
+
+    /* 清码之后没有任何快照：回空列表，不下发 NRC */
+    n = uds_handle_request(&srv, req, 2, resp, sizeof(resp));
+    check(n == 2, "no snapshot -> 2 byte response");
+    check(resp[0] == 0x59 && resp[1] == 0x03, "positive response 59 03");
+    check(n == 2 && resp[2] != UDS_NRC_REQUEST_OUT_OF_RANGE, "empty list is not an NRC");
+
+    confirm_bus_off();
+
+    n = uds_handle_request(&srv, req, 2, resp, sizeof(resp));
+    check(n == 6, "one DTC with snapshot -> 2 + 4 bytes");
+    check(resp[0] == 0x59 && resp[1] == 0x03, "positive response 59 03");
+    check(resp[2] == 0xC0 && resp[3] == 0x01 && resp[4] == 0x87, "DTC encoded in 3 bytes");
+    check(resp[5] == UDS_DTC_RECORD_SNAPSHOT, "record number follows the DTC");
+
+    /* 参数长度不对 */
+    n = uds_handle_request(&srv, req, 3, resp, sizeof(resp));
+    check(n == 3 && resp[2] == UDS_NRC_INCORRECT_LENGTH, "0x03 rejects extra bytes");
+
+    /* 只有 confirmed 且有快照的码才出现；清码后列表清空 */
+    dtc_clear(&g_dtcs, DTC_GROUP_ALL);
+    n = uds_handle_request(&srv, req, 2, resp, sizeof(resp));
+    check(n == 2, "clear removes the record from the list");
+}
+
+static void test_stored_data(void)
+{
+    uds_server_t srv;
+    uint8_t resp[64];
+    uint8_t req[3] = {UDS_SID_READ_DTC, UDS_DTC_REPORT_STORED_DATA, UDS_DTC_RECORD_SNAPSHOT};
+    int n;
+
+    printf("[0x19 05 report stored data by record number]\n");
+    dtc_set_snapshot_provider(&g_dtcs, snap_provider);
+    with_dtcs(&srv);
+    dtc_clear(&g_dtcs, DTC_GROUP_ALL);
+
+    /* 还没有记录：记录号不存在，必须是 0x31 而不是空响应 */
+    n = uds_handle_request(&srv, req, 3, resp, sizeof(resp));
+    check(n == 3 && resp[2] == UDS_NRC_REQUEST_OUT_OF_RANGE,
+          "no record stored -> NRC 0x31");
+
+    confirm_bus_off();
+
+    n = uds_handle_request(&srv, req, 3, resp, sizeof(resp));
+    check(n == 13, "3 header bytes + 4 DTC/status + 6 snapshot bytes");
+    check(resp[0] == 0x59 && resp[1] == 0x05, "positive response 59 05");
+    check(resp[2] == UDS_DTC_RECORD_SNAPSHOT, "record number echoed");
+    check(resp[3] == 0xC0 && resp[4] == 0x01 && resp[5] == 0x87, "DTC follows the record number");
+    check(resp[6] == dtc_find(&g_dtcs, DTC_BUS_OFF)->status, "status follows the DTC");
+    check(resp[7] == 1 && resp[8] == 0x00 && resp[9] == 0x01,
+          "identifier count and DID follow the status");
+    check(resp[10] == 0x0E && resp[12] == 0x80, "identifier data follows the DID");
+
+    /* 0xFF 要全部记录，单记录时内容相同 */
+    req[2] = UDS_DTC_RECORD_ALL;
+    n = uds_handle_request(&srv, req, 3, resp, sizeof(resp));
+    check(n == 13 && resp[2] == UDS_DTC_RECORD_ALL,
+          "record 0xFF is echoed and returns every record");
+
+    /* 只有 1 号记录 */
+    req[2] = 0x02;
+    n = uds_handle_request(&srv, req, 3, resp, sizeof(resp));
+    check(n == 3 && resp[2] == UDS_NRC_REQUEST_OUT_OF_RANGE,
+          "unknown record number -> NRC 0x31");
+
+    /* 长度不对 */
+    req[2] = UDS_DTC_RECORD_SNAPSHOT;
+    n = uds_handle_request(&srv, req, 2, resp, sizeof(resp));
+    check(n == 3 && resp[2] == UDS_NRC_INCORRECT_LENGTH,
+          "0x05 rejects a missing record number");
+
+    n = uds_handle_request(&srv, req, 4, resp, sizeof(resp));
+    check(n == 3 && resp[2] == UDS_NRC_INCORRECT_LENGTH, "0x05 rejects extra bytes");
 }
 
 static void test_ext_data(void)
@@ -370,6 +464,8 @@ int main(void)
     test_report_by_mask();
     test_report_supported();
     test_snapshot();
+    test_snapshot_id();
+    test_stored_data();
     test_ext_data();
     test_clear();
     test_no_store();

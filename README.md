@@ -22,7 +22,7 @@
 | `0x10` | 会话控制 | 默认 / 编程 / 扩展会话切换 |
 | `0x11` | ECU 复位 | 硬复位与软复位 |
 | `0x14` | 清故障码 | 清除故障存储器，需扩展会话 |
-| `0x19` | 读故障码 | 按掩码读码、读快照、读扩展数据、读支持列表 |
+| `0x19` | 读故障码 | 按掩码读码、读快照标识、读快照、按记录号读、读扩展数据、读支持列表 |
 | `0x22` | 读数据 | 按 DID 读取运行参数与版本信息 |
 | `0x27` | 安全访问 | 种子-密钥鉴权 |
 | `0x2E` | 写数据 | 按 DID 写入配置与阈值 |
@@ -171,7 +171,7 @@ make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口）
 ```
 
-`make test` 当前包含十三套用例，共 519 项断言：
+`make test` 当前包含十三套用例，共 542 项断言：
 
 | 套件 | 覆盖内容 |
 |---|---|
@@ -182,7 +182,7 @@ make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口�
 | `test/uds_transfer_test` | 传输服务：完整刷写、块序号回绕、重传不重复写、越界与溢出、写失败 |
 | `test/uds_routine_test` | 例程控制：内置擦除与 CRC（期望值由 zlib 独立算出）、自定义例程、权限与参数校验 |
 | `test/dtc_test` | 故障存储：待确认与确认、老化（含「没测过不算好」）、发生次数按沿计、快照只抓一次、清码 |
-| `test/uds_dtc_test` | `0x19` 五个子功能的逐字节响应格式、`0x14` 的会话门槛、无故障存储器时回 `NRC 0x11` |
+| `test/uds_dtc_test` | `0x19` 七个子功能的逐字节响应格式、`0x14` 的会话门槛、无故障存储器时回 `NRC 0x11` |
 | `test/boot_test` | CRC32、分区表序列化、跳转检查、双区升级与回滚前提 |
 | `test/node_health_test` | 总线健康状态机：降级触发、Bus Off 计数窗口、恢复观察期、长期降级 |
 | `test/nvm_store_test` | 双页参数存储：交替写入、序号回绕、擦除后掉电、页头写一半掉电、CRC 损坏回退、两页都坏 |
@@ -226,7 +226,7 @@ sudo ip link set up vcan0
 ./ecu-server --seconds 60 &
 python3 tools/udsoncan_interop.py   # 基础诊断服务，14 项断言
 python3 tools/flash_interop.py      # 完整刷写 + CRC 交叉校验
-python3 tools/dtc_interop.py        # 故障码：读码 / 快照 / 清码
+python3 tools/dtc_interop.py        # 故障码：读码 / 快照标识 / 快照内容 / 清码，28 项断言
 
 # 跨复位：脚本自己重启 ecu-server，验证写下去的东西还在
 make persist-interop
