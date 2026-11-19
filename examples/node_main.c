@@ -266,6 +266,7 @@ int main(int argc, char **argv)
     int seconds = 10;
 
     const char *nvm_path = ".node-nvm.bin";
+    const char *ifname = "vcan0";
 
     for (int i = 1; i < argc; i++)
     {
@@ -273,19 +274,25 @@ int main(int argc, char **argv)
             seconds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--nvm") == 0 && i + 1 < argc)
             nvm_path = argv[++i];
+        /*
+         * 接口名可选。网关联调时节点接在 vcan1，tester 在 vcan0 ——
+         * 写死 vcan0 就没法验证「上位机经由网关访问节点」这条链路。
+         */
+        else if (strcmp(argv[i], "--if") == 0 && i + 1 < argc)
+            ifname = argv[++i];
     }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
     memset(&sk, 0, sizeof(sk));
-    strncpy(sk.ifname, "vcan0", sizeof(sk.ifname) - 1);
+    strncpy(sk.ifname, ifname, sizeof(sk.ifname) - 1);
     sk.rx_filter_id = ID_REQUEST; /* 只收诊断请求，回环回来的周期帧不要 */
     sk.fd = -1;
 
     if (can_driver_init(&can, can_socketcan_ops(), &sk, 500000) != CAN_OK)
     {
-        printf("cannot open vcan0\n");
+        printf("cannot open %s\n", ifname);
         return 1;
     }
 

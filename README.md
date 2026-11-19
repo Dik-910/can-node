@@ -169,7 +169,12 @@ DBC 是唯一权威来源，已通过 `cantools` 加载与编解码往返验证�
 make test       # 编译并运行全部 PC 侧测试，不依赖硬件
 make dbc        # 由 docs/can_matrix.dbc 重新生成编解码代码
 make vcan       # 在 vcan0 上跑端到端演示（需要先建好 CAN 接口）
+
+# 节点常驻，可指定接口：网关联调时节点接在 vcan1、tester 在 vcan0
+./node --if vcan1 --seconds 3600
 ```
+
+`node` 的 `--if` 默认 `vcan0`，`--seconds` 默认 10 秒。`--nvm` 指定参数区文件。
 
 `make test` 当前包含十三套用例，共 542 项断言：
 
